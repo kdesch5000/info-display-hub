@@ -24,6 +24,12 @@ An Arduino project for the **Lilygo T-Display S3** (ESP32-S3 + 1.9" ST7789 170×
 ### Screen System
 Each display screen is a `void drawScreenXxx()` function that draws into the `sprite` (TFT_eSprite) and calls `sprite.pushSprite(0, 0)` at the end. Screens are registered in the `allScreens[]` array with a pointer to their draw function and a pointer to their enable/disable bool in the config struct.
 
+**Current screens (7 total):**
+- Clock, Weather, Sports (standalone)
+- Bedroom Humidity, Espresso Stats, Backyard Temp, Sump Pump (Home Assistant)
+
+**HA screens use hardcoded entity IDs** (`#define HA_ENTITY_*`) rather than configurable fields, since each screen has custom graphics and data parsing specific to its sensor.
+
 **To add a new screen:**
 1. Create `void drawScreenXxx()` following the existing pattern
 2. Add a `bool screen_xxx;` field to the `Config` struct
@@ -38,8 +44,11 @@ All settings live in the `Config` struct and are persisted via the ESP32 `Prefer
 ### Data Fetching
 API calls happen on intervals in the main `loop()`:
 - Weather: every 5 minutes (`WEATHER_INTERVAL`)
-- Home Assistant: every 30 seconds (`HA_INTERVAL`)
+- HA current states: every 30 seconds (`HA_STATE_INTERVAL`) — humidity, espresso total, backyard temp, sump last cycle
+- HA history: every 10 minutes (`HA_HISTORY_INTERVAL`) — espresso yesterday shots, sump 7-day bar chart
 - Time: NTP auto-sync on boot
+
+The `fetchHAState()` helper fetches a single entity's state and is reused by `fetchHAStates()` which batches all 4 HA entity lookups. History API calls (`fetchEspressoHistory()`, `fetchSumpHistory()`) use `/api/history/period/{start}` with `minimal_response&no_attributes` to keep response sizes small.
 
 New data sources should follow this pattern: define a data struct, a fetch function, an interval constant, and a `lastXxxFetch` timestamp.
 

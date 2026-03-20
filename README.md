@@ -6,7 +6,10 @@ A WiFi-connected rotating info display with OTA updates and web-based configurat
 - **Clock** — NTP-synced time, date, day of week
 - **Weather** — Temperature, feels-like, humidity, conditions (OpenWeatherMap)
 - **Sports** — Placeholder ready for your preferred sports API
-- **Home Assistant** — Any HA entity (sensor, switch, etc.)
+- **Bedroom Humidity** — Animated water droplet with humidity %, color-coded status (Home Assistant)
+- **Espresso Stats** — Coffee cup graphic with total count + yesterday's shots (Home Assistant + History API)
+- **Backyard Temperature** — Thermometer graphic with color-coded temp reading (Home Assistant)
+- **Sump Pump Monitor** — 24h run count, time since last run, 7-day bar chart (Home Assistant + History API)
 
 ## Hardware
 - Lilygo T-Display S3 (~$15–20)
@@ -81,7 +84,7 @@ Browse to `http://<device-ip>/` to change any setting. The IP is shown on the ne
 3. Upload the `.bin` file from your sketch's `build` folder
 4. Device reboots with new firmware
 
-## API Keys
+## API Keys & Services
 
 ### OpenWeatherMap (free)
 1. Sign up at https://openweathermap.org/api
@@ -89,15 +92,25 @@ Browse to `http://<device-ip>/` to change any setting. The IP is shown on the ne
 3. Enter the key in the web config
 
 ### Home Assistant
+Required for the Humidity, Espresso, Backyard Temp, and Sump Pump screens.
+
 1. In HA, go to your profile → Long-Lived Access Tokens → Create Token
-2. Enter the token, your HA URL, and the entity ID in the web config
-3. Any entity works: `sensor.temperature`, `binary_sensor.front_door`, `switch.lamp`, etc.
+2. Enter the token and your HA URL in the web config
+3. Entity IDs are hardcoded for each screen (see `#define HA_ENTITY_*` in the source)
+
+#### HA Entities Used
+| Screen | Entity ID | Data |
+|---|---|---|
+| Bedroom Humidity | `sensor.my_humidifier_humidity` | Current state (every 30s) |
+| Espresso Stats | `sensor.kd_micra_total_coffees_made` | Current state + History API (every 10 min) |
+| Backyard Temp | `sensor.backyard_temperature_sensor_temperature` | Current state (every 30s) |
+| Sump Pump | `sensor.pumpspy_battery_backup_main_last_cycle` | Current state + History API (every 10 min) |
 
 ## Customization Ideas
 
 - **Add more screens**: Create a new `drawScreenXxx()` function, add it to the `allScreens[]` array
+- **Change HA entities**: Edit the `#define HA_ENTITY_*` constants at the top of the sketch
 - **Sports API**: ESPN's hidden API, The Score, or sportsdata.io — fetch JSON, parse, display
-- **Multiple HA entities**: Expand the HA screen to cycle through several entities
 - **Display brightness**: Use `ledcWrite()` to control the backlight pin based on time of day
 - **MQTT**: Subscribe to topics and display messages from your smart home
 - **Packers schedule**: Pull the NFL schedule API and show next game time

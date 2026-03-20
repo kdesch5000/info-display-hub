@@ -5,7 +5,10 @@
  *   - NTP clock
  *   - Weather display (OpenWeatherMap)
  *   - Sports scores placeholder
- *   - Home Assistant sensor readout
+ *   - Bedroom Humidity (HA sensor with animated water droplet)
+ *   - Espresso Stats (HA sensor with coffee cup + history)
+ *   - Backyard Temperature (HA sensor with thermometer graphic)
+ *   - Sump Pump Monitor (HA sensor with 7-day bar chart)
  *   - OTA firmware updates (web-based)
  *   - Web configuration portal
  *
@@ -34,6 +37,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ElegantOTA.h>
+#include <math.h>
 
 // ============================================================
 // DISPLAY SETUP
@@ -51,6 +55,14 @@ TFT_eSprite sprite = TFT_eSprite(&tft);
 #define BTN_RIGHT 14
 
 // ============================================================
+// HARDCODED HA ENTITY IDS (purpose-built screens)
+// ============================================================
+#define HA_ENTITY_HUMIDITY  "sensor.my_humidifier_humidity"
+#define HA_ENTITY_ESPRESSO  "sensor.kd_micra_total_coffees_made"
+#define HA_ENTITY_BACKYARD  "sensor.backyard_temperature_sensor_temperature"
+#define HA_ENTITY_SUMP      "sensor.pumpspy_battery_backup_main_last_cycle"
+
+// ============================================================
 // CONFIGURATION (stored in NVMe flash via Preferences)
 // ============================================================
 Preferences prefs;
@@ -62,13 +74,15 @@ struct Config {
   char weather_city[64];
   char ha_url[128];         // Home Assistant URL, e.g. http://192.168.1.100:8123
   char ha_token[256];       // Home Assistant long-lived access token
-  char ha_entity[64];       // HA entity to display, e.g. sensor.temperature
   int  rotation_seconds;    // seconds per screen
   char timezone[48];        // POSIX timezone string
   bool screen_clock;
   bool screen_weather;
   bool screen_sports;
-  bool screen_ha;
+  bool screen_humidity;
+  bool screen_espresso;
+  bool screen_backyard;
+  bool screen_sump;
 } config;
 
 void loadConfig() {
@@ -79,13 +93,15 @@ void loadConfig() {
   strlcpy(config.weather_city,   prefs.getString("weather_city", "Chicago").c_str(), sizeof(config.weather_city));
   strlcpy(config.ha_url,         prefs.getString("ha_url", "").c_str(),         sizeof(config.ha_url));
   strlcpy(config.ha_token,       prefs.getString("ha_token", "").c_str(),       sizeof(config.ha_token));
-  strlcpy(config.ha_entity,      prefs.getString("ha_entity", "").c_str(),      sizeof(config.ha_entity));
   config.rotation_seconds =      prefs.getInt("rotate_sec", 5);
   strlcpy(config.timezone,       prefs.getString("timezone", "CST6CDT,M3.2.0,M11.1.0").c_str(), sizeof(config.timezone));
-  config.screen_clock   = prefs.getBool("scr_clock", true);
-  config.screen_weather = prefs.getBool("scr_weather", true);
-  config.screen_sports  = prefs.getBool("scr_sports", true);
-  config.screen_ha      = prefs.getBool("scr_ha", false);
+  config.screen_clock    = prefs.getBool("scr_clock", true);
+  config.screen_weather  = prefs.getBool("scr_weather", true);
+  config.screen_sports   = prefs.getBool("scr_sports", true);
+  config.screen_humidity = prefs.getBool("scr_humid", false);
+  config.screen_espresso = prefs.getBool("scr_espres", false);
+  config.screen_backyard = prefs.getBool("scr_backyd", false);
+  config.screen_sump     = prefs.getBool("scr_sump", false);
   prefs.end();
 }
 
@@ -97,13 +113,15 @@ void saveConfig() {
   prefs.putString("weather_city", config.weather_city);
   prefs.putString("ha_url",       config.ha_url);
   prefs.putString("ha_token",     config.ha_token);
-  prefs.putString("ha_entity",    config.ha_entity);
   prefs.putInt("rotate_sec",      config.rotation_seconds);
   prefs.putString("timezone",     config.timezone);
   prefs.putBool("scr_clock",      config.screen_clock);
   prefs.putBool("scr_weather",    config.screen_weather);
   prefs.putBool("scr_sports",     config.screen_sports);
-  prefs.putBool("scr_ha",         config.screen_ha);
+  prefs.putBool("scr_humid",      config.screen_humidity);
+  prefs.putBool("scr_espres",     config.screen_espresso);
+  prefs.putBool("scr_backyd",     config.screen_backyard);
+  prefs.putBool("scr_sump",       config.screen_sump);
   prefs.end();
 }
 
@@ -239,6 +257,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
   .msg.ok { display: block; background: #1a2e1a; color: #4ade80; }
   .msg.err { display: block; background: #2e1a1a; color: #ff6b6b; }
   .hint { font-size: 0.75em; color: #555; margin-top: 4px; }
+  .section-label { font-size: 0.75em; color: #555; margin-top: 8px; margin-bottom: 4px; }
 </style>
 </head>
 <body>
@@ -270,8 +289,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
       <input type="text" name="ha_url" id="ha_url" placeholder="http://192.168.1.100:8123">
       <label>Long-Lived Access Token</label>
       <input type="password" name="ha_token" id="ha_token">
-      <label>Entity ID</label>
-      <input type="text" name="ha_entity" id="ha_entity" placeholder="sensor.living_room_temp">
+      <p class="hint">Required for Humidity, Espresso, Backyard Temp, and Sump Pump screens</p>
     </div>
 
     <div class="card">
@@ -295,9 +313,23 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
         <span>Sports Scores</span>
         <label class="toggle"><input type="checkbox" name="scr_sports" id="scr_sports"><span class="slider"></span></label>
       </div>
+
+      <p class="section-label">Home Assistant Screens</p>
       <div class="toggle-row">
-        <span>Home Assistant</span>
-        <label class="toggle"><input type="checkbox" name="scr_ha" id="scr_ha"><span class="slider"></span></label>
+        <span>Bedroom Humidity</span>
+        <label class="toggle"><input type="checkbox" name="scr_humidity" id="scr_humidity"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <span>Espresso Stats</span>
+        <label class="toggle"><input type="checkbox" name="scr_espresso" id="scr_espresso"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <span>Backyard Temp</span>
+        <label class="toggle"><input type="checkbox" name="scr_backyard" id="scr_backyard"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <span>Sump Pump</span>
+        <label class="toggle"><input type="checkbox" name="scr_sump" id="scr_sump"><span class="slider"></span></label>
       </div>
     </div>
 
@@ -317,13 +349,15 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
     document.getElementById('weather_city').value = c.weather_city || '';
     document.getElementById('ha_url').value = c.ha_url || '';
     document.getElementById('ha_token').value = c.ha_token || '';
-    document.getElementById('ha_entity').value = c.ha_entity || '';
     document.getElementById('rotate_sec').value = c.rotate_sec || 5;
     document.getElementById('timezone').value = c.timezone || '';
     document.getElementById('scr_clock').checked = c.scr_clock;
     document.getElementById('scr_weather').checked = c.scr_weather;
     document.getElementById('scr_sports').checked = c.scr_sports;
-    document.getElementById('scr_ha').checked = c.scr_ha;
+    document.getElementById('scr_humidity').checked = c.scr_humidity;
+    document.getElementById('scr_espresso').checked = c.scr_espresso;
+    document.getElementById('scr_backyard').checked = c.scr_backyard;
+    document.getElementById('scr_sump').checked = c.scr_sump;
   });
 
   document.getElementById('configForm').addEventListener('submit', function(e) {
@@ -336,13 +370,15 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
       weather_city: document.getElementById('weather_city').value,
       ha_url: document.getElementById('ha_url').value,
       ha_token: document.getElementById('ha_token').value,
-      ha_entity: document.getElementById('ha_entity').value,
       rotate_sec: parseInt(document.getElementById('rotate_sec').value),
       timezone: document.getElementById('timezone').value,
       scr_clock: document.getElementById('scr_clock').checked,
       scr_weather: document.getElementById('scr_weather').checked,
       scr_sports: document.getElementById('scr_sports').checked,
-      scr_ha: document.getElementById('scr_ha').checked,
+      scr_humidity: document.getElementById('scr_humidity').checked,
+      scr_espresso: document.getElementById('scr_espresso').checked,
+      scr_backyard: document.getElementById('scr_backyard').checked,
+      scr_sump: document.getElementById('scr_sump').checked,
     };
     fetch('/api/config', {
       method: 'POST',
@@ -381,13 +417,15 @@ void setupWebServer() {
     doc["weather_city"] = config.weather_city;
     doc["ha_url"]       = config.ha_url;
     doc["ha_token"]     = config.ha_token;
-    doc["ha_entity"]    = config.ha_entity;
     doc["rotate_sec"]   = config.rotation_seconds;
     doc["timezone"]     = config.timezone;
     doc["scr_clock"]    = config.screen_clock;
     doc["scr_weather"]  = config.screen_weather;
     doc["scr_sports"]   = config.screen_sports;
-    doc["scr_ha"]       = config.screen_ha;
+    doc["scr_humidity"] = config.screen_humidity;
+    doc["scr_espresso"] = config.screen_espresso;
+    doc["scr_backyard"] = config.screen_backyard;
+    doc["scr_sump"]     = config.screen_sump;
     String json;
     serializeJson(doc, json);
     request->send(200, "application/json", json);
@@ -404,13 +442,15 @@ void setupWebServer() {
       strlcpy(config.weather_city,    obj["weather_city"] | "",    sizeof(config.weather_city));
       strlcpy(config.ha_url,          obj["ha_url"] | "",          sizeof(config.ha_url));
       strlcpy(config.ha_token,        obj["ha_token"] | "",        sizeof(config.ha_token));
-      strlcpy(config.ha_entity,       obj["ha_entity"] | "",       sizeof(config.ha_entity));
       config.rotation_seconds =       obj["rotate_sec"] | 5;
       strlcpy(config.timezone,        obj["timezone"] | "CST6CDT,M3.2.0,M11.1.0", sizeof(config.timezone));
-      config.screen_clock   = obj["scr_clock"]   | true;
-      config.screen_weather = obj["scr_weather"] | true;
-      config.screen_sports  = obj["scr_sports"]  | true;
-      config.screen_ha      = obj["scr_ha"]      | false;
+      config.screen_clock    = obj["scr_clock"]    | true;
+      config.screen_weather  = obj["scr_weather"]  | true;
+      config.screen_sports   = obj["scr_sports"]   | true;
+      config.screen_humidity = obj["scr_humidity"]  | false;
+      config.screen_espresso = obj["scr_espresso"]  | false;
+      config.screen_backyard = obj["scr_backyard"]  | false;
+      config.screen_sump     = obj["scr_sump"]      | false;
 
       saveConfig();
       request->send(200, "application/json", "{\"status\":\"ok\"}");
@@ -558,36 +598,279 @@ void fetchWeather() {
   http.end();
 }
 
-// --- Home Assistant ---
-struct HAData {
-  char state[64];
-  char friendly_name[64];
-  char unit[16];
+// --- Home Assistant Data Structs ---
+
+struct HumidityData {
+  float humidity;
   bool valid;
-} haData = {"", "", "", false};
+} humidityData = {0, false};
 
-unsigned long lastHAFetch = 0;
-const unsigned long HA_INTERVAL = 30000;  // 30 seconds
+struct EspressoData {
+  int totalCoffees;
+  int yesterdayShots;
+  bool stateValid;
+  bool historyValid;
+} espressoData = {0, 0, false, false};
 
-void fetchHA() {
-  if (strlen(config.ha_url) == 0 || strlen(config.ha_token) == 0 || strlen(config.ha_entity) == 0) return;
+struct BackyardTempData {
+  float temperature;
+  bool valid;
+} backyardData = {0, false};
+
+struct SumpData {
+  int runsLast24h;
+  int dailyRuns[7];       // [0]=today, [6]=6 days ago
+  char lastRunTime[24];   // "3h 14m ago"
+  bool stateValid;
+  bool historyValid;
+} sumpData = {0, {0}, "", false, false};
+
+unsigned long lastHAStateFetch   = 0;
+unsigned long lastHAHistoryFetch = 0;
+const unsigned long HA_STATE_INTERVAL   = 30000;   // 30 seconds
+const unsigned long HA_HISTORY_INTERVAL = 600000;  // 10 minutes
+
+// --- HA Helper: fetch a single entity state ---
+bool fetchHAState(const char* entityId, char* state, size_t stateLen) {
+  if (strlen(config.ha_url) == 0 || strlen(config.ha_token) == 0) return false;
+  HTTPClient http;
+  String url = String(config.ha_url) + "/api/states/" + entityId;
+  http.begin(url);
+  http.addHeader("Authorization", String("Bearer ") + config.ha_token);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(5000);
+  int code = http.GET();
+  bool ok = false;
+  if (code == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    if (!deserializeJson(doc, payload)) {
+      strlcpy(state, doc["state"] | "unknown", stateLen);
+      ok = true;
+    }
+  }
+  http.end();
+  return ok;
+}
+
+// --- Batch state fetches for all HA screens ---
+void fetchHAStates() {
+  char buf[64];
+
+  // Humidity
+  if (fetchHAState(HA_ENTITY_HUMIDITY, buf, sizeof(buf))) {
+    humidityData.humidity = atof(buf);
+    humidityData.valid = true;
+    Serial.printf("HA Humidity: %.0f%%\n", humidityData.humidity);
+  }
+
+  // Espresso total
+  if (fetchHAState(HA_ENTITY_ESPRESSO, buf, sizeof(buf))) {
+    espressoData.totalCoffees = atoi(buf);
+    espressoData.stateValid = true;
+    Serial.printf("HA Espresso total: %d\n", espressoData.totalCoffees);
+  }
+
+  // Backyard temp
+  if (fetchHAState(HA_ENTITY_BACKYARD, buf, sizeof(buf))) {
+    backyardData.temperature = atof(buf);
+    backyardData.valid = true;
+    Serial.printf("HA Backyard: %.1fF\n", backyardData.temperature);
+  }
+
+  // Sump pump last cycle
+  if (fetchHAState(HA_ENTITY_SUMP, buf, sizeof(buf))) {
+    computeSumpTimeAgo(buf);
+    sumpData.stateValid = true;
+    Serial.printf("HA Sump last run: %s\n", sumpData.lastRunTime);
+  }
+}
+
+// --- Compute "Xh Ym ago" from ISO timestamp ---
+void computeSumpTimeAgo(const char* isoTimestamp) {
+  int y, mo, d, h, mi, s;
+  if (sscanf(isoTimestamp, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
+    struct tm entryTm = {0};
+    entryTm.tm_year = y - 1900;
+    entryTm.tm_mon = mo - 1;
+    entryTm.tm_mday = d;
+    entryTm.tm_hour = h;
+    entryTm.tm_min = mi;
+    entryTm.tm_sec = s;
+    // HA returns UTC timestamps, convert using timegm equivalent
+    time_t entryTime = mktime(&entryTm);
+    // Adjust for local vs UTC offset since mktime assumes local
+    struct tm nowTm;
+    if (!getLocalTime(&nowTm)) return;
+    time_t nowTime = mktime(&nowTm);
+
+    // Both are now in the same basis (local mktime), so compute diff
+    // The entry timestamp is UTC, so adjust by our timezone offset
+    struct tm utcNow;
+    getLocalTime(&utcNow);
+    time_t localNow = mktime(&utcNow);
+    struct tm gmNow;
+    gmtime_r(&localNow, &gmNow);
+    time_t utcNowT = mktime(&gmNow);
+    long tzOffsetSec = (long)(localNow - utcNowT);
+
+    // Entry time in local = entryTime + tzOffset
+    long diffSec = nowTime - (entryTime + tzOffsetSec);
+    if (diffSec < 0) diffSec = 0;
+
+    int hours = diffSec / 3600;
+    int mins = (diffSec % 3600) / 60;
+
+    if (hours >= 24) {
+      snprintf(sumpData.lastRunTime, sizeof(sumpData.lastRunTime), "%dd %dh ago", hours / 24, hours % 24);
+    } else if (hours > 0) {
+      snprintf(sumpData.lastRunTime, sizeof(sumpData.lastRunTime), "%dh %dm ago", hours, mins);
+    } else {
+      snprintf(sumpData.lastRunTime, sizeof(sumpData.lastRunTime), "%dm ago", mins);
+    }
+  } else {
+    strlcpy(sumpData.lastRunTime, "unknown", sizeof(sumpData.lastRunTime));
+  }
+}
+
+// --- Espresso History: compute yesterday's shot count ---
+void fetchEspressoHistory() {
+  if (strlen(config.ha_url) == 0 || strlen(config.ha_token) == 0) return;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  // Compute yesterday start (local midnight) and end
+  time_t now_t = mktime(&timeinfo);
+  time_t todayMidnight = now_t - (timeinfo.tm_hour * 3600 + timeinfo.tm_min * 60 + timeinfo.tm_sec);
+  time_t yesterdayStart = todayMidnight - 86400;
+  time_t yesterdayEnd = todayMidnight;
+
+  // Format as ISO strings in UTC for the API
+  // HA history API accepts local time strings too
+  char startStr[26], endStr[26];
+  struct tm ts;
+  localtime_r(&yesterdayStart, &ts);
+  strftime(startStr, sizeof(startStr), "%Y-%m-%dT%H:%M:%S", &ts);
+  localtime_r(&yesterdayEnd, &ts);
+  strftime(endStr, sizeof(endStr), "%Y-%m-%dT%H:%M:%S", &ts);
 
   HTTPClient http;
-  String url = String(config.ha_url) + "/api/states/" + config.ha_entity;
+  String url = String(config.ha_url) + "/api/history/period/" + startStr
+    + "?filter_entity_id=" + HA_ENTITY_ESPRESSO
+    + "&end_time=" + endStr
+    + "&minimal_response&no_attributes";
 
   http.begin(url);
   http.addHeader("Authorization", String("Bearer ") + config.ha_token);
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
   int code = http.GET();
 
   if (code == 200) {
     String payload = http.getString();
     JsonDocument doc;
-    if (!deserializeJson(doc, payload)) {
-      strlcpy(haData.state, doc["state"] | "unknown", sizeof(haData.state));
-      strlcpy(haData.friendly_name, doc["attributes"]["friendly_name"] | config.ha_entity, sizeof(haData.friendly_name));
-      strlcpy(haData.unit, doc["attributes"]["unit_of_measurement"] | "", sizeof(haData.unit));
-      haData.valid = true;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (!err && doc.is<JsonArray>() && doc.size() > 0 && doc[0].is<JsonArray>()) {
+      JsonArray entries = doc[0].as<JsonArray>();
+      if (entries.size() >= 2) {
+        // Find first and last valid numeric states
+        int first = -1, last = -1;
+        for (size_t i = 0; i < entries.size(); i++) {
+          const char* st = entries[i]["state"] | "";
+          if (st[0] >= '0' && st[0] <= '9') {
+            int val = atoi(st);
+            if (first < 0) first = val;
+            last = val;
+          }
+        }
+        if (first >= 0 && last >= 0) {
+          espressoData.yesterdayShots = last - first;
+        } else {
+          espressoData.yesterdayShots = 0;
+        }
+      } else {
+        espressoData.yesterdayShots = 0;
+      }
+      espressoData.historyValid = true;
+      Serial.printf("HA Espresso yesterday: %d shots\n", espressoData.yesterdayShots);
+    }
+  }
+  http.end();
+}
+
+// --- Sump Pump History: 7-day daily run counts ---
+void fetchSumpHistory() {
+  if (strlen(config.ha_url) == 0 || strlen(config.ha_token) == 0) return;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  // Compute 7 days ago at local midnight
+  time_t now_t = mktime(&timeinfo);
+  time_t todayMidnight = now_t - (timeinfo.tm_hour * 3600 + timeinfo.tm_min * 60 + timeinfo.tm_sec);
+  time_t weekStart = todayMidnight - (6 * 86400);
+
+  char startStr[26];
+  struct tm ts;
+  localtime_r(&weekStart, &ts);
+  strftime(startStr, sizeof(startStr), "%Y-%m-%dT%H:%M:%S", &ts);
+
+  HTTPClient http;
+  String url = String(config.ha_url) + "/api/history/period/" + startStr
+    + "?filter_entity_id=" + HA_ENTITY_SUMP
+    + "&minimal_response&no_attributes";
+
+  http.begin(url);
+  http.addHeader("Authorization", String("Bearer ") + config.ha_token);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+  int code = http.GET();
+
+  if (code == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (!err && doc.is<JsonArray>() && doc.size() > 0 && doc[0].is<JsonArray>()) {
+      JsonArray entries = doc[0].as<JsonArray>();
+
+      // Zero out daily counts
+      memset(sumpData.dailyRuns, 0, sizeof(sumpData.dailyRuns));
+      int runs24h = 0;
+
+      // Skip the first entry (it's the initial state, not a cycle event)
+      for (size_t i = 1; i < entries.size(); i++) {
+        const char* lc = entries[i]["last_changed"] | "";
+        int ey, emo, ed, eh, emi, es;
+        if (sscanf(lc, "%d-%d-%dT%d:%d:%d", &ey, &emo, &ed, &eh, &emi, &es) == 6) {
+          struct tm entryTm = {0};
+          entryTm.tm_year = ey - 1900;
+          entryTm.tm_mon = emo - 1;
+          entryTm.tm_mday = ed;
+          entryTm.tm_hour = eh;
+          entryTm.tm_min = emi;
+          entryTm.tm_sec = es;
+          time_t entryTime = mktime(&entryTm);
+
+          // Determine day bucket (entry timestamps from HA are in UTC, but
+          // last_changed with no timezone is local for history period queries)
+          int daysAgo = (todayMidnight - entryTime) / 86400;
+          if (entryTime >= todayMidnight) daysAgo = 0;
+          if (daysAgo >= 0 && daysAgo < 7) {
+            sumpData.dailyRuns[daysAgo]++;
+          }
+
+          // Last 24h count
+          if ((now_t - entryTime) < 86400 && (now_t - entryTime) >= 0) {
+            runs24h++;
+          }
+        }
+      }
+      sumpData.runsLast24h = runs24h;
+      sumpData.historyValid = true;
+      Serial.printf("HA Sump: %d runs in 24h, daily=[", runs24h);
+      for (int i = 0; i < 7; i++) Serial.printf("%d ", sumpData.dailyRuns[i]);
+      Serial.println("]");
     }
   }
   http.end();
@@ -604,6 +887,10 @@ void fetchHA() {
 #define CLR_DIM      0x4228   // Dark gray
 #define CLR_TEXT     0xFFFF   // White
 #define CLR_GREEN    0x2E89   // Muted green
+#define CLR_WATER    0x04DF   // Water blue
+#define CLR_COFFEE   0x8A22   // Coffee brown
+#define CLR_COLD     0x001F   // Icy blue
+#define CLR_HOT      0xF800   // Red
 
 void drawScreenClock() {
   sprite.fillSprite(CLR_BG);
@@ -748,7 +1035,6 @@ void drawScreenSports() {
   sprite.drawFastHLine(20, 42, 130, CLR_DIM);
 
   // Placeholder - replace with your preferred sports API
-  // ESPN, The Score, or sportsdata.io all have free tiers
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
   sprite.drawString("Add a sports API", 20, 80);
@@ -780,19 +1066,22 @@ void drawScreenSports() {
   sprite.pushSprite(0, 0);
 }
 
-void drawScreenHA() {
+// ============================================================
+// HA SCREEN 1: BEDROOM HUMIDITY
+// ============================================================
+void drawScreenHumidity() {
   sprite.fillSprite(CLR_BG);
 
+  // Header
   sprite.setTextColor(CLR_PRIMARY);
   sprite.setTextSize(2);
-  sprite.drawString("HOME", 20, 20);
-
+  sprite.drawString("HUMIDITY", 20, 20);
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("Home Assistant", 20, 42);
+  sprite.drawString("Bedroom", 20, 42);
   sprite.drawFastHLine(20, 58, 130, CLR_DIM);
 
-  if (!haData.valid) {
+  if (!humidityData.valid) {
     sprite.setTextColor(TFT_RED);
     sprite.setTextSize(2);
     sprite.drawString("No data", 30, 140);
@@ -803,33 +1092,448 @@ void drawScreenHA() {
     return;
   }
 
-  // Entity name
-  sprite.setTextColor(CLR_ACCENT);
-  sprite.setTextSize(2);
-  int tw = sprite.textWidth(haData.friendly_name);
-  if (tw > SCREEN_WIDTH - 20) sprite.setTextSize(1);
-  sprite.drawString(haData.friendly_name, 20, 100);
+  float h = humidityData.humidity;
 
-  // State value (large)
+  // Color based on humidity level
+  uint16_t dropColor;
+  const char* statusText;
+  if (h < 30) {
+    dropColor = CLR_ACCENT;  // Orange = too dry
+    statusText = "Too Dry";
+  } else if (h <= 60) {
+    dropColor = CLR_WATER;   // Blue = comfortable
+    statusText = "Comfortable";
+  } else {
+    dropColor = 0x0410;      // Dark teal = too humid
+    statusText = "Too Humid";
+  }
+
+  // --- Water droplet icon ---
+  int cx = 85;  // center X
+  int bulbY = 130;
+  int bulbR = 22;
+  int tipY = 80;
+
+  // Droplet body (filled circle + triangle)
+  sprite.fillCircle(cx, bulbY, bulbR, dropColor);
+  sprite.fillTriangle(cx - bulbR, bulbY, cx + bulbR, bulbY, cx, tipY, dropColor);
+
+  // Water level inside droplet (animated waves)
+  // Fill level based on humidity: 0% = bottom of bulb, 100% = top of droplet
+  int fillTop = bulbY + bulbR - (int)((h / 100.0f) * (bulbY + bulbR - tipY));
+  float phase = millis() / 300.0f;
+
+  // Draw animated wave lines inside the droplet
+  for (int wy = fillTop; wy <= bulbY + bulbR; wy++) {
+    // Compute the horizontal extent of the droplet at this Y
+    int halfWidth;
+    if (wy >= bulbY - bulbR && wy <= bulbY + bulbR) {
+      // In the circle portion
+      float dy = (float)(wy - bulbY);
+      halfWidth = (int)sqrtf(bulbR * bulbR - dy * dy);
+    } else if (wy < bulbY && wy >= tipY) {
+      // In the triangle portion
+      float t = (float)(wy - tipY) / (float)(bulbY - tipY);
+      halfWidth = (int)(t * bulbR);
+    } else {
+      continue;
+    }
+
+    // Wave offset
+    float wave = sinf(phase + wy * 0.15f) * 2.0f;
+    int x1 = cx - halfWidth + 1;
+    int x2 = cx + halfWidth - 1;
+
+    // Only draw the fill below the wave surface
+    if (wy == fillTop) {
+      // Draw the wave surface line
+      for (int px = x1; px <= x2; px++) {
+        float waveAtPx = sinf(phase + px * 0.08f) * 3.0f;
+        if (wy + (int)waveAtPx <= fillTop + 2) {
+          sprite.drawPixel(px, wy + (int)waveAtPx, CLR_TEXT);
+        }
+      }
+    }
+  }
+
+  // Droplet outline (slightly brighter)
+  sprite.drawCircle(cx, bulbY, bulbR, CLR_TEXT);
+  // Triangle outline edges
+  sprite.drawLine(cx - bulbR, bulbY, cx, tipY, CLR_TEXT);
+  sprite.drawLine(cx + bulbR, bulbY, cx, tipY, CLR_TEXT);
+
+  // Small shine highlight on droplet
+  sprite.fillCircle(cx - 8, bulbY - 10, 3, CLR_TEXT);
+
+  // --- Large humidity value ---
   sprite.setTextColor(CLR_TEXT);
   sprite.setTextSize(4);
-  char stateBuf[80];
-  snprintf(stateBuf, sizeof(stateBuf), "%s%s", haData.state, haData.unit);
-  tw = sprite.textWidth(stateBuf);
-  if (tw > SCREEN_WIDTH - 20) {
-    sprite.setTextSize(3);
-    tw = sprite.textWidth(stateBuf);
-  }
-  sprite.drawString(stateBuf, (SCREEN_WIDTH - tw) / 2, 150);
+  char humBuf[10];
+  snprintf(humBuf, sizeof(humBuf), "%.0f%%", h);
+  int tw = sprite.textWidth(humBuf);
+  sprite.drawString(humBuf, (SCREEN_WIDTH - tw) / 2, 175);
 
-  // Entity ID
-  sprite.setTextColor(CLR_DIM);
-  sprite.setTextSize(1);
-  sprite.drawString(config.ha_entity, 20, 260);
+  // --- Status text ---
+  sprite.setTextColor(dropColor);
+  sprite.setTextSize(2);
+  tw = sprite.textWidth(statusText);
+  sprite.drawString(statusText, (SCREEN_WIDTH - tw) / 2, 225);
+
+  // Decorative line
+  sprite.drawFastHLine(30, 260, 110, CLR_DIM);
 
   sprite.pushSprite(0, 0);
 }
 
+// ============================================================
+// HA SCREEN 2: ESPRESSO STATS
+// ============================================================
+void drawScreenEspresso() {
+  sprite.fillSprite(CLR_BG);
+
+  // Header
+  sprite.setTextColor(CLR_PRIMARY);
+  sprite.setTextSize(2);
+  sprite.drawString("ESPRESSO", 20, 20);
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("De'Longhi Micra", 20, 42);
+  sprite.drawFastHLine(20, 58, 130, CLR_DIM);
+
+  if (!espressoData.stateValid) {
+    sprite.setTextColor(TFT_RED);
+    sprite.setTextSize(2);
+    sprite.drawString("No data", 30, 140);
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Check HA config", 30, 165);
+    sprite.pushSprite(0, 0);
+    return;
+  }
+
+  // --- Coffee cup graphic ---
+  int cupX = 55, cupY = 85;
+  int cupW = 50, cupH = 40;
+
+  // Cup body
+  sprite.fillRoundRect(cupX, cupY, cupW, cupH, 4, CLR_COFFEE);
+  // Cup rim highlight
+  sprite.drawFastHLine(cupX, cupY, cupW, CLR_ACCENT);
+  sprite.drawFastHLine(cupX, cupY + 1, cupW, CLR_ACCENT);
+
+  // Handle (right side)
+  for (int a = -40; a <= 40; a++) {
+    float rad = a * 3.14159f / 180.0f;
+    int hx = cupX + cupW + (int)(10 * cosf(rad));
+    int hy = cupY + cupH / 2 + (int)(12 * sinf(rad));
+    sprite.drawPixel(hx, hy, CLR_COFFEE);
+    sprite.drawPixel(hx + 1, hy, CLR_COFFEE);
+  }
+
+  // Saucer
+  sprite.fillRoundRect(cupX - 10, cupY + cupH + 2, cupW + 20, 6, 3, CLR_DIM);
+
+  // Coffee fill inside cup
+  int fillH = cupH - 8;
+  sprite.fillRect(cupX + 3, cupY + 6, cupW - 6, fillH, 0x4100);  // dark coffee color
+
+  // --- Animated steam ---
+  float t = millis() / 200.0f;
+  for (int s = 0; s < 3; s++) {
+    int baseX = cupX + 10 + s * 15;
+    for (int y = cupY - 5; y > cupY - 25; y--) {
+      float age = (float)(cupY - 5 - y) / 20.0f;  // 0 at bottom, 1 at top
+      float wave = sinf(t + y * 0.25f + s * 1.5f) * (2.0f + age * 3.0f);
+      // Fade out as steam rises
+      uint16_t steamColor = (age < 0.5f) ? CLR_DIM : 0x2104;
+      sprite.drawPixel(baseX + (int)wave, y, steamColor);
+      sprite.drawPixel(baseX + (int)wave + 1, y, steamColor);
+    }
+  }
+
+  // --- Total coffees (large) ---
+  sprite.setTextColor(CLR_TEXT);
+  sprite.setTextSize(4);
+  char totalBuf[10];
+  snprintf(totalBuf, sizeof(totalBuf), "%d", espressoData.totalCoffees);
+  int tw = sprite.textWidth(totalBuf);
+  sprite.drawString(totalBuf, (SCREEN_WIDTH - tw) / 2, 155);
+
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  tw = sprite.textWidth("total coffees");
+  sprite.drawString("total coffees", (SCREEN_WIDTH - tw) / 2, 195);
+
+  // --- Yesterday's shots ---
+  sprite.drawFastHLine(30, 215, 110, CLR_DIM);
+
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("Yesterday", 20, 230);
+
+  if (espressoData.historyValid) {
+    sprite.setTextColor(CLR_ACCENT);
+    sprite.setTextSize(3);
+    char yBuf[16];
+    snprintf(yBuf, sizeof(yBuf), "%d", espressoData.yesterdayShots);
+    sprite.drawString(yBuf, 20, 248);
+
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    const char* shotLabel = (espressoData.yesterdayShots == 1) ? "shot" : "shots";
+    sprite.drawString(shotLabel, 20 + sprite.textWidth(yBuf) * 3 + 8, 258);
+  } else {
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("loading...", 20, 250);
+  }
+
+  sprite.pushSprite(0, 0);
+}
+
+// ============================================================
+// HA SCREEN 3: BACKYARD TEMPERATURE
+// ============================================================
+void drawScreenBackyard() {
+  sprite.fillSprite(CLR_BG);
+
+  // Header
+  sprite.setTextColor(CLR_PRIMARY);
+  sprite.setTextSize(2);
+  sprite.drawString("BACKYARD", 20, 20);
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("Temperature", 20, 42);
+  sprite.drawFastHLine(20, 58, 130, CLR_DIM);
+
+  if (!backyardData.valid) {
+    sprite.setTextColor(TFT_RED);
+    sprite.setTextSize(2);
+    sprite.drawString("No data", 30, 140);
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Check HA config", 30, 165);
+    sprite.pushSprite(0, 0);
+    return;
+  }
+
+  float temp = backyardData.temperature;
+
+  // Color based on temperature
+  uint16_t tempColor;
+  const char* statusText;
+  if (temp <= 32) {
+    tempColor = CLR_COLD;
+    statusText = "Freezing";
+  } else if (temp <= 50) {
+    tempColor = CLR_PRIMARY;
+    statusText = "Cold";
+  } else if (temp <= 70) {
+    tempColor = CLR_GREEN;
+    statusText = "Cool";
+  } else if (temp <= 85) {
+    tempColor = CLR_ACCENT;
+    statusText = "Warm";
+  } else {
+    tempColor = CLR_HOT;
+    statusText = "Hot";
+  }
+
+  // --- Thermometer graphic (left side) ---
+  int thX = 30;     // center X of thermometer
+  int thTop = 75;   // top of tube
+  int thBot = 185;  // bottom of tube (where bulb starts)
+  int tubeW = 8;    // half-width of tube
+  int bulbR = 16;   // bulb radius
+
+  // Tube outline
+  sprite.fillRect(thX - tubeW, thTop, tubeW * 2, thBot - thTop, CLR_DIM);
+  sprite.fillCircle(thX, thBot, bulbR, CLR_DIM);
+
+  // Mercury fill
+  // Map temp: -20F = empty, 120F = full
+  float fillPct = constrain((temp + 20.0f) / 140.0f, 0.0f, 1.0f);
+  int mercuryTop = thBot - (int)(fillPct * (thBot - thTop - 4));
+  sprite.fillRect(thX - tubeW + 3, mercuryTop, tubeW * 2 - 6, thBot - mercuryTop, tempColor);
+  sprite.fillCircle(thX, thBot, bulbR - 4, tempColor);
+
+  // Tube outline border
+  sprite.drawRect(thX - tubeW, thTop, tubeW * 2, thBot - thTop, CLR_TEXT);
+  sprite.drawCircle(thX, thBot, bulbR, CLR_TEXT);
+
+  // Scale marks
+  for (int i = 0; i <= 4; i++) {
+    int markY = thTop + 4 + i * ((thBot - thTop - 8) / 4);
+    sprite.drawFastHLine(thX + tubeW + 2, markY, 6, CLR_DIM);
+  }
+
+  // Temperature labels on scale
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("120", thX + tubeW + 10, thTop + 2);
+  sprite.drawString("0", thX + tubeW + 10, thBot - 8);
+
+  // --- Large temperature value (right side) ---
+  sprite.setTextColor(CLR_TEXT);
+  sprite.setTextSize(5);
+  char tempBuf[10];
+  snprintf(tempBuf, sizeof(tempBuf), "%.0f", temp);
+  int tw = sprite.textWidth(tempBuf);
+  sprite.drawString(tempBuf, 75, 110);
+
+  // Degree + F
+  sprite.setTextSize(2);
+  sprite.setTextColor(CLR_DIM);
+  sprite.drawString("o", 75 + tw * 5 / 4 + 2, 105);
+  sprite.setTextColor(CLR_TEXT);
+  sprite.drawString("F", 75 + tw * 5 / 4 + 14, 110);
+
+  // --- Status text ---
+  sprite.setTextColor(tempColor);
+  sprite.setTextSize(2);
+  tw = sprite.textWidth(statusText);
+  sprite.drawString(statusText, (SCREEN_WIDTH - tw) / 2, 230);
+
+  sprite.drawFastHLine(30, 260, 110, CLR_DIM);
+
+  sprite.pushSprite(0, 0);
+}
+
+// ============================================================
+// HA SCREEN 4: SUMP PUMP MONITOR
+// ============================================================
+void drawScreenSump() {
+  sprite.fillSprite(CLR_BG);
+
+  // Header
+  sprite.setTextColor(CLR_PRIMARY);
+  sprite.setTextSize(2);
+  sprite.drawString("SUMP PUMP", 15, 20);
+  sprite.drawFastHLine(15, 42, 140, CLR_DIM);
+
+  if (!sumpData.stateValid) {
+    sprite.setTextColor(TFT_RED);
+    sprite.setTextSize(2);
+    sprite.drawString("No data", 30, 140);
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Check HA config", 30, 165);
+    sprite.pushSprite(0, 0);
+    return;
+  }
+
+  // --- Pump icon (simple) ---
+  // Small pipe/pump graphic
+  sprite.fillRect(20, 55, 8, 20, CLR_PRIMARY);        // vertical pipe
+  sprite.fillRect(20, 55, 25, 6, CLR_PRIMARY);         // horizontal pipe top
+  sprite.fillRoundRect(40, 58, 16, 14, 3, CLR_ACCENT); // pump body
+  sprite.fillRect(56, 62, 12, 6, CLR_PRIMARY);         // output pipe
+
+  // --- 24-hour run count ---
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("Last 24 Hours", 80, 55);
+
+  sprite.setTextColor(CLR_TEXT);
+  sprite.setTextSize(3);
+  char countBuf[10];
+  snprintf(countBuf, sizeof(countBuf), "%d", sumpData.runsLast24h);
+  sprite.drawString(countBuf, 80, 68);
+
+  int cw = sprite.textWidth(countBuf);
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString(sumpData.runsLast24h == 1 ? "run" : "runs", 80 + cw * 3 + 8, 78);
+
+  // --- Last run time ---
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  char lastBuf[40];
+  snprintf(lastBuf, sizeof(lastBuf), "Last run: %s", sumpData.lastRunTime);
+  sprite.drawString(lastBuf, 15, 100);
+
+  // --- 7-Day Bar Chart ---
+  sprite.drawFastHLine(15, 120, 140, CLR_DIM);
+  sprite.setTextColor(CLR_PRIMARY);
+  sprite.setTextSize(1);
+  sprite.drawString("7-Day History", 15, 128);
+
+  if (!sumpData.historyValid) {
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Loading history...", 15, 180);
+    sprite.pushSprite(0, 0);
+    return;
+  }
+
+  int chartX = 12;
+  int chartY = 145;
+  int chartH = 130;
+  int barW = 16;
+  int gap = 4;
+
+  // Find max for scaling
+  int maxVal = 1;
+  for (int i = 0; i < 7; i++) {
+    if (sumpData.dailyRuns[i] > maxVal) maxVal = sumpData.dailyRuns[i];
+  }
+
+  // Baseline
+  sprite.drawFastHLine(chartX, chartY + chartH, 7 * (barW + gap), CLR_DIM);
+
+  // Get day-of-week names
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+
+  for (int i = 0; i < 7; i++) {
+    int dayIdx = 6 - i;  // 6=oldest on left, 0=today on right
+    int x = chartX + i * (barW + gap);
+    int barH = 0;
+    if (maxVal > 0) {
+      barH = (sumpData.dailyRuns[dayIdx] * (chartH - 20)) / maxVal;
+    }
+    if (sumpData.dailyRuns[dayIdx] > 0 && barH < 4) barH = 4;  // min visible height
+
+    // Bar color: today = accent, others = primary
+    uint16_t color = (dayIdx == 0) ? CLR_ACCENT : CLR_PRIMARY;
+
+    if (barH > 0) {
+      sprite.fillRect(x, chartY + chartH - barH, barW, barH, color);
+    }
+
+    // Day label below baseline
+    // Compute day of week for this bar
+    time_t now_t = mktime(&timeinfo);
+    time_t dayT = now_t - dayIdx * 86400;
+    struct tm dayTm;
+    localtime_r(&dayT, &dayTm);
+    const char* dayNames[] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
+    sprite.setTextColor((dayIdx == 0) ? CLR_ACCENT : CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString(dayNames[dayTm.tm_wday], x + 1, chartY + chartH + 4);
+
+    // Count above bar (if > 0)
+    if (sumpData.dailyRuns[dayIdx] > 0) {
+      char cStr[4];
+      snprintf(cStr, sizeof(cStr), "%d", sumpData.dailyRuns[dayIdx]);
+      sprite.setTextColor(CLR_TEXT);
+      sprite.setTextSize(1);
+      sprite.drawString(cStr, x + 3, chartY + chartH - barH - 12);
+    }
+  }
+
+  // "Today" indicator
+  sprite.setTextColor(CLR_ACCENT);
+  sprite.setTextSize(1);
+  int todayX = chartX + 6 * (barW + gap);
+  sprite.drawString("^", todayX + 5, chartY + chartH + 14);
+
+  sprite.pushSprite(0, 0);
+}
+
+// ============================================================
+// NETWORK INFO SCREEN (both buttons held)
+// ============================================================
 void drawScreenIP() {
   sprite.fillSprite(CLR_BG);
 
@@ -886,10 +1590,13 @@ struct Screen {
 };
 
 Screen allScreens[] = {
-  { drawScreenClock,   &config.screen_clock },
-  { drawScreenWeather, &config.screen_weather },
-  { drawScreenSports,  &config.screen_sports },
-  { drawScreenHA,      &config.screen_ha },
+  { drawScreenClock,    &config.screen_clock },
+  { drawScreenWeather,  &config.screen_weather },
+  { drawScreenSports,   &config.screen_sports },
+  { drawScreenHumidity, &config.screen_humidity },
+  { drawScreenEspresso, &config.screen_espresso },
+  { drawScreenBackyard, &config.screen_backyard },
+  { drawScreenSump,     &config.screen_sump },
 };
 const int NUM_SCREENS = sizeof(allScreens) / sizeof(Screen);
 
@@ -933,7 +1640,9 @@ void setup() {
     if (connectWiFi()) {
       setupTime();
       fetchWeather();
-      fetchHA();
+      fetchHAStates();
+      fetchEspressoHistory();
+      fetchSumpHistory();
     }
   } else {
     startAPMode();
@@ -1001,9 +1710,14 @@ void loop() {
       fetchWeather();
       lastWeatherFetch = now;
     }
-    if (now - lastHAFetch >= HA_INTERVAL) {
-      fetchHA();
-      lastHAFetch = now;
+    if (now - lastHAStateFetch >= HA_STATE_INTERVAL) {
+      fetchHAStates();
+      lastHAStateFetch = now;
+    }
+    if (now - lastHAHistoryFetch >= HA_HISTORY_INTERVAL) {
+      fetchEspressoHistory();
+      fetchSumpHistory();
+      lastHAHistoryFetch = now;
     }
   }
 
