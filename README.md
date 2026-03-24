@@ -10,6 +10,7 @@ A WiFi-connected rotating info display with OTA updates and web-based configurat
 - **Espresso Stats** — Coffee cup graphic with total count + yesterday's shots (Home Assistant + History API)
 - **Backyard Temperature** — Thermometer graphic with color-coded temp reading (Home Assistant)
 - **Sump Pump Monitor** — 24h run count, time since last run, 7-day bar chart (Home Assistant + History API)
+- **Ring Cameras** — Cycles through 5 Ring camera snapshots via HA camera_proxy (Home Assistant)
 
 ## Hardware
 - Lilygo T-Display S3 (~$15–20)
@@ -36,6 +37,7 @@ A WiFi-connected rotating info display with OTA updates and web-based configurat
 ### 3. Install Libraries
 Install these via **Sketch → Include Library → Manage Libraries**:
 - **TFT_eSPI** by Bodmer
+- **TJpg_Decoder** by Bodmer
 - **ArduinoJson** by Benoit Blanchon
 - **ElegantOTA** by Ayush Sharma
 
@@ -92,7 +94,7 @@ Browse to `http://<device-ip>/` to change any setting. The IP is shown on the ne
 3. Enter the key in the web config
 
 ### Home Assistant
-Required for the Humidity, Espresso, Backyard Temp, and Sump Pump screens.
+Required for the Humidity, Espresso, Backyard Temp, Sump Pump, and Ring Cameras screens.
 
 1. In HA, go to your profile → Long-Lived Access Tokens → Create Token
 2. Enter the token and your HA URL in the web config
@@ -105,6 +107,7 @@ Required for the Humidity, Espresso, Backyard Temp, and Sump Pump screens.
 | Espresso Stats | `sensor.kd_micra_total_coffees_made` | Current state + History API (every 10 min) |
 | Backyard Temp | `sensor.backyard_temperature_sensor_temperature` | Current state (every 30s) |
 | Sump Pump | `sensor.pumpspy_battery_backup_main_last_cycle` | Current state + History API (every 10 min) |
+| Ring Cameras | `camera.*_snapshot` (5 cameras) | Camera proxy JPEG snapshot (every 30s, cycles cameras) |
 
 ## Customization Ideas
 

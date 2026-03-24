@@ -1,3 +1,4 @@
+// v2.5 - 2026-03-24 - Add Ring camera snapshot screen
 /*
  * Info Display Hub - Lilygo T-Display S3
  * =======================================
@@ -9,6 +10,7 @@
  *   - Espresso Stats (HA sensor with coffee cup + history)
  *   - Backyard Temperature (HA sensor with thermometer graphic)
  *   - Sump Pump Monitor (HA sensor with 7-day bar chart)
+ *   - Ring Camera Snapshots (HA camera_proxy, cycles through cameras)
  *   - OTA firmware updates (web-based)
  *   - Web configuration portal
  *
@@ -20,6 +22,7 @@
  *   - AsyncTCP (https://github.com/me-no-dev/AsyncTCP)
  *   - ESPAsyncWebServer (https://github.com/me-no-dev/ESPAsyncWebServer)
  *   - ElegantOTA (by Ayush Sharma)
+ *   - TJpg_Decoder (by Bodmer)
  *
  * Board setup in Arduino IDE:
  *   1. Add ESP32 board package via Board Manager
@@ -38,6 +41,21 @@
 #include <ESPAsyncWebServer.h>
 #include <ElegantOTA.h>
 #include <math.h>
+#include <TJpg_Decoder.h>
+
+// ============================================================
+// COLOR PALETTE (defined early so all functions can use them)
+// ============================================================
+#define CLR_BG       0x0000   // Black
+#define CLR_PRIMARY  0x5D7F   // Soft blue
+#define CLR_ACCENT   0xFE20   // Warm amber
+#define CLR_DIM      0x4228   // Dark gray
+#define CLR_TEXT     0xFFFF   // White
+#define CLR_GREEN    0x2E89   // Muted green
+#define CLR_WATER    0x04DF   // Water blue
+#define CLR_COFFEE   0x8A22   // Coffee brown
+#define CLR_COLD     0x001F   // Icy blue
+#define CLR_HOT      0xF800   // Red
 
 // ============================================================
 // DISPLAY SETUP
@@ -45,8 +63,8 @@
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite sprite = TFT_eSprite(&tft);
 
-#define SCREEN_WIDTH  170
-#define SCREEN_HEIGHT 320
+#define SCREEN_WIDTH  320
+#define SCREEN_HEIGHT 170
 
 // ============================================================
 // BUTTON PINS (T-Display S3 built-in buttons)
@@ -61,6 +79,23 @@ TFT_eSprite sprite = TFT_eSprite(&tft);
 #define HA_ENTITY_ESPRESSO  "sensor.kd_micra_total_coffees_made"
 #define HA_ENTITY_BACKYARD  "sensor.backyard_temperature_sensor_temperature"
 #define HA_ENTITY_SUMP      "sensor.pumpspy_battery_backup_main_last_cycle"
+
+// Ring camera snapshot entities
+const char* RING_CAM_ENTITIES[] = {
+  "camera.front_door_snapshot",
+  "camera.basement_door_snapshot",
+  "camera.alley_garage_door_snapshot",
+  "camera.gangway_snapshot",
+  "camera.backyard_deck_snapshot",
+};
+const char* RING_CAM_NAMES[] = {
+  "Front Door",
+  "Basement Door",
+  "Alley Garage",
+  "Gangway",
+  "Backyard Deck",
+};
+const int RING_CAM_COUNT = 5;
 
 // ============================================================
 // CONFIGURATION (stored in NVMe flash via Preferences)
@@ -83,6 +118,7 @@ struct Config {
   bool screen_espresso;
   bool screen_backyard;
   bool screen_sump;
+  bool screen_ring;
 } config;
 
 void loadConfig() {
@@ -102,6 +138,7 @@ void loadConfig() {
   config.screen_espresso = prefs.getBool("scr_espres", false);
   config.screen_backyard = prefs.getBool("scr_backyd", false);
   config.screen_sump     = prefs.getBool("scr_sump", false);
+  config.screen_ring     = prefs.getBool("scr_ring", false);
   prefs.end();
 }
 
@@ -122,6 +159,7 @@ void saveConfig() {
   prefs.putBool("scr_espres",     config.screen_espresso);
   prefs.putBool("scr_backyd",     config.screen_backyard);
   prefs.putBool("scr_sump",       config.screen_sump);
+  prefs.putBool("scr_ring",       config.screen_ring);
   prefs.end();
 }
 
@@ -135,6 +173,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Info Display Hub</title>
 <style>
@@ -331,6 +370,12 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
         <span>Sump Pump</span>
         <label class="toggle"><input type="checkbox" name="scr_sump" id="scr_sump"><span class="slider"></span></label>
       </div>
+
+      <p class="section-label">Camera Screens</p>
+      <div class="toggle-row">
+        <span>Ring Cameras</span>
+        <label class="toggle"><input type="checkbox" name="scr_ring" id="scr_ring"><span class="slider"></span></label>
+      </div>
     </div>
 
     <button type="submit" class="btn">Save &amp; Reboot</button>
@@ -338,6 +383,12 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
   </form>
 
   <a href="/update" class="btn btn-ota">Firmware Update (OTA)</a>
+
+  <div class="card">
+    <h2>WiFi Scan Log <span style="color:#555;font-weight:normal;font-size:0.85em;">&mdash; recorded on failed connection</span></h2>
+    <div id="wifiLogContent"><p style="color:#555;font-size:0.85em;">Loading...</p></div>
+  </div>
+
 </div>
 
 <script>
@@ -358,6 +409,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
     document.getElementById('scr_espresso').checked = c.scr_espresso;
     document.getElementById('scr_backyard').checked = c.scr_backyard;
     document.getElementById('scr_sump').checked = c.scr_sump;
+    document.getElementById('scr_ring').checked = c.scr_ring;
   });
 
   document.getElementById('configForm').addEventListener('submit', function(e) {
@@ -379,6 +431,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
       scr_espresso: document.getElementById('scr_espresso').checked,
       scr_backyard: document.getElementById('scr_backyard').checked,
       scr_sump: document.getElementById('scr_sump').checked,
+      scr_ring: document.getElementById('scr_ring').checked,
     };
     fetch('/api/config', {
       method: 'POST',
@@ -396,6 +449,33 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
       msg.className = 'msg err';
       msg.textContent = 'Connection lost (device may be rebooting).';
     });
+  });
+
+  // Load WiFi scan log
+  fetch('/api/wifilog').then(r=>r.json()).then(d=>{
+    const el = document.getElementById('wifiLogContent');
+    if (!d.count) {
+      el.innerHTML = '<p style="color:#555;font-size:0.85em;">No scan log yet &mdash; recorded automatically when WiFi connection fails.</p>';
+      return;
+    }
+    let html = '<p style="color:#888;font-size:0.78em;margin-bottom:12px;">Target: <span style="color:#fbbf24;">' + d.target + '</span> &mdash; ' + d.count + ' networks saved</p>';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:0.82em;">';
+    html += '<tr style="color:#555;border-bottom:1px solid #2a2d3a;"><th style="text-align:left;padding:4px 4px 4px 0;">SSID</th><th style="text-align:left;padding:4px 8px;">BSSID</th><th style="text-align:right;padding:4px 0;">dBm</th></tr>';
+    d.networks.forEach(n=>{
+      const isTarget = n.ssid === d.target;
+      const rc = n.rssi >= -50 ? '#4ade80' : n.rssi >= -65 ? '#fbbf24' : n.rssi >= -75 ? '#f97316' : '#ef4444';
+      const ssidColor = isTarget ? '#4ade80' : '#e0e0e0';
+      const rowBg = isTarget ? 'background:#162316;' : '';
+      html += '<tr style="border-bottom:1px solid #1a1d27;' + rowBg + '">';
+      html += '<td style="padding:6px 4px 6px 0;color:' + ssidColor + ';">' + (n.ssid || '<em style="color:#444">(hidden)</em>') + (isTarget ? ' &#10004;' : '') + '</td>';
+      html += '<td style="padding:6px 8px;color:#668;font-family:monospace;font-size:0.9em;">' + n.bssid + '</td>';
+      html += '<td style="text-align:right;padding:6px 0;color:' + rc + ';font-weight:bold;">' + n.rssi + '</td>';
+      html += '</tr>';
+    });
+    html += '</table>';
+    el.innerHTML = html;
+  }).catch(()=>{
+    document.getElementById('wifiLogContent').innerHTML = '<p style="color:#555;font-size:0.85em;">Could not load WiFi log.</p>';
   });
 </script>
 </body>
@@ -426,6 +506,7 @@ void setupWebServer() {
     doc["scr_espresso"] = config.screen_espresso;
     doc["scr_backyard"] = config.screen_backyard;
     doc["scr_sump"]     = config.screen_sump;
+    doc["scr_ring"]     = config.screen_ring;
     String json;
     serializeJson(doc, json);
     request->send(200, "application/json", json);
@@ -451,6 +532,7 @@ void setupWebServer() {
       config.screen_espresso = obj["scr_espresso"]  | false;
       config.screen_backyard = obj["scr_backyard"]  | false;
       config.screen_sump     = obj["scr_sump"]      | false;
+      config.screen_ring     = obj["scr_ring"]      | false;
 
       saveConfig();
       request->send(200, "application/json", "{\"status\":\"ok\"}");
@@ -462,12 +544,38 @@ void setupWebServer() {
   );
   server.addHandler(handler);
 
+  // GET saved WiFi scan log from NVS
+  server.on("/api/wifilog", HTTP_GET, [](AsyncWebServerRequest *request) {
+    prefs.begin("wifilog", true);
+    int cnt = prefs.getInt("wl_cnt", 0);
+    JsonDocument doc;
+    doc["count"]  = cnt;
+    doc["target"] = config.wifi_ssid;
+    JsonArray nets = doc["networks"].to<JsonArray>();
+    for (int i = 0; i < cnt; i++) {
+      char keyS[10], keyB[10], keyR[10];
+      snprintf(keyS, sizeof(keyS), "wl%dssid", i);
+      snprintf(keyB, sizeof(keyB), "wl%dbssid", i);
+      snprintf(keyR, sizeof(keyR), "wl%drssi", i);
+      JsonObject net = nets.add<JsonObject>();
+      net["ssid"]  = prefs.getString(keyS, "");
+      net["bssid"] = prefs.getString(keyB, "");
+      net["rssi"]  = prefs.getInt(keyR, 0);
+    }
+    prefs.end();
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
   // ElegantOTA handles /update endpoint automatically
   ElegantOTA.begin(&server);
 
   server.begin();
   Serial.println("Web server started on port 80");
 }
+
+void drawWifiScan();  // forward declaration
 
 // ============================================================
 // WIFI CONNECTION
@@ -478,7 +586,7 @@ bool connectWiFi() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE);
   tft.setTextSize(2);
-  tft.setCursor(10, 140);
+  tft.setCursor(10, 70);
   tft.print("Connecting WiFi...");
 
   WiFi.mode(WIFI_STA);
@@ -495,21 +603,161 @@ bool connectWiFi() {
     Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
 
     tft.fillScreen(TFT_BLACK);
-    tft.setCursor(10, 120);
+    tft.setCursor(10, 55);
     tft.setTextSize(2);
     tft.print("WiFi Connected");
-    tft.setCursor(10, 150);
+    tft.setCursor(10, 85);
     tft.setTextSize(1);
     tft.printf("IP: %s", WiFi.localIP().toString().c_str());
-    tft.setCursor(10, 170);
+    tft.setCursor(10, 100);
     tft.print("Config: http://");
     tft.print(WiFi.localIP().toString());
     delay(3000);
     return true;
   }
 
-  Serial.println("\nWiFi connection failed.");
+  Serial.println("\nWiFi connection failed. Scanning networks...");
+  drawWifiScan();
   return false;
+}
+
+// Show all visible WiFi networks with slow scroll — called on connection failure
+void drawWifiScan() {
+  // Scanning splash
+  sprite.fillSprite(CLR_BG);
+  sprite.setTextColor(CLR_PRIMARY);
+  sprite.setTextSize(2);
+  sprite.drawString("WIFI SCAN", 8, 8);
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("Scanning for networks...", 8, 32);
+  sprite.pushSprite(0, 0);
+
+  // Disconnect cleanly so the radio is free to scan
+  WiFi.disconnect(true);
+  delay(500);
+
+  int n = WiFi.scanNetworks();
+  Serial.printf("WiFi scan: %d networks found\n", n);
+
+  if (n <= 0) {
+    sprite.fillSprite(CLR_BG);
+    sprite.setTextColor(TFT_RED);
+    sprite.setTextSize(2);
+    sprite.drawString("No networks found", 8, 65);
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Device may be out of range", 8, 92);
+    sprite.pushSprite(0, 0);
+    delay(15000);
+    return;
+  }
+
+  // Sort indices by RSSI descending (strongest first)
+  const int MAX_NETS = 25;
+  int cnt = min(n, MAX_NETS);
+  int order[MAX_NETS];
+  for (int i = 0; i < cnt; i++) order[i] = i;
+  for (int i = 0; i < cnt - 1; i++)
+    for (int j = 0; j < cnt - i - 1; j++)
+      if (WiFi.RSSI(order[j]) < WiFi.RSSI(order[j + 1])) {
+        int t = order[j]; order[j] = order[j + 1]; order[j + 1] = t;
+      }
+
+  // Save top 7 to NVS so it can be reviewed later
+  prefs.begin("wifilog", false);
+  int saveCount = min(cnt, 7);
+  prefs.putInt("wl_cnt", saveCount);
+  for (int i = 0; i < saveCount; i++) {
+    int idx = order[i];
+    char keyS[10], keyB[10], keyR[10];
+    snprintf(keyS, sizeof(keyS), "wl%dssid", i);
+    snprintf(keyB, sizeof(keyB), "wl%dbssid", i);
+    snprintf(keyR, sizeof(keyR), "wl%drssi", i);
+    prefs.putString(keyS, WiFi.SSID(idx));
+    uint8_t b[6];
+    memcpy(b, WiFi.BSSID(idx), 6);
+    char bssidStr[18];
+    snprintf(bssidStr, sizeof(bssidStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             b[0], b[1], b[2], b[3], b[4], b[5]);
+    prefs.putString(keyB, bssidStr);
+    prefs.putInt(keyR, WiFi.RSSI(idx));
+  }
+  prefs.end();
+  Serial.printf("WiFi scan log saved (%d networks)\n", saveCount);
+
+  // Log everything to Serial
+  for (int i = 0; i < cnt; i++) {
+    int idx = order[i];
+    uint8_t* b = WiFi.BSSID(idx);
+    Serial.printf("  [%2d] %-28s  %02X:%02X:%02X:%02X:%02X:%02X  %d dBm  ch%d\n",
+                  i + 1, WiFi.SSID(idx).c_str(),
+                  b[0], b[1], b[2], b[3], b[4], b[5],
+                  WiFi.RSSI(idx), WiFi.channel(idx));
+  }
+
+  const int VISIBLE  = 5;     // rows shown at once
+  const int ROW_H    = 24;    // px per network entry
+  const int HDR_H    = 44;    // px reserved for header
+  const int PAUSE_MS = 2500;  // ms between scroll steps
+
+  unsigned long loopStart = millis();
+  int startIdx = 0;
+
+  // Scroll continuously for 90 seconds then fall through to AP mode
+  while (millis() - loopStart < 90000) {
+    sprite.fillSprite(CLR_BG);
+
+    // Header
+    sprite.setTextColor(CLR_PRIMARY);
+    sprite.setTextSize(2);
+    sprite.drawString("WIFI SCAN", 8, 8);
+
+    sprite.setTextColor(CLR_ACCENT);
+    sprite.setTextSize(1);
+    sprite.drawString(String("Target: ") + config.wifi_ssid, 8, 30);
+
+    // Position counter top-right
+    char countBuf[12];
+    snprintf(countBuf, sizeof(countBuf), "%d / %d", startIdx + 1, cnt);
+    int cw = sprite.textWidth(countBuf);
+    sprite.setTextColor(CLR_DIM);
+    sprite.drawString(countBuf, SCREEN_WIDTH - cw - 8, 30);
+
+    sprite.drawFastHLine(0, HDR_H - 2, SCREEN_WIDTH, CLR_DIM);
+
+    // Network rows — wrap around so it loops continuously
+    for (int i = 0; i < VISIBLE; i++) {
+      int ni  = (startIdx + i) % cnt;
+      int idx = order[ni];
+      bool isTarget = (WiFi.SSID(idx) == String(config.wifi_ssid));
+      int y = HDR_H + i * ROW_H;
+
+      // Row 1: SSID + RSSI
+      String ssid = WiFi.SSID(idx);
+      if (ssid.length() == 0) ssid = "(hidden)";
+      if (ssid.length() > 22) ssid = ssid.substring(0, 21) + "~";
+      char row1[52];
+      snprintf(row1, sizeof(row1), "%-22s %d dBm", ssid.c_str(), WiFi.RSSI(idx));
+      sprite.setTextColor(isTarget ? CLR_GREEN : CLR_TEXT);
+      sprite.setTextSize(1);
+      sprite.drawString(row1, 8, y);
+
+      // Row 2: BSSID + channel
+      uint8_t bssid[6];
+      memcpy(bssid, WiFi.BSSID(idx), 6);
+      char row2[48];
+      snprintf(row2, sizeof(row2), "%02X:%02X:%02X:%02X:%02X:%02X  ch%d",
+               bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+               WiFi.channel(idx));
+      sprite.setTextColor(isTarget ? CLR_PRIMARY : CLR_DIM);
+      sprite.drawString(row2, 8, y + 12);
+    }
+
+    sprite.pushSprite(0, 0);
+    delay(PAUSE_MS);
+    startIdx = (startIdx + 1) % cnt;
+  }
 }
 
 // ============================================================
@@ -522,21 +770,21 @@ void startAPMode() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_CYAN);
   tft.setTextSize(2);
-  tft.setCursor(10, 80);
+  tft.setCursor(10, 12);
   tft.print("Setup Mode");
   tft.setTextColor(TFT_WHITE);
   tft.setTextSize(1);
-  tft.setCursor(10, 120);
+  tft.setCursor(10, 48);
   tft.print("Connect to WiFi:");
-  tft.setCursor(10, 140);
+  tft.setCursor(10, 62);
   tft.setTextColor(TFT_YELLOW);
   tft.print("InfoDisplayHub");
   tft.setTextColor(TFT_WHITE);
-  tft.setCursor(10, 160);
+  tft.setCursor(10, 80);
   tft.print("Password: configure");
-  tft.setCursor(10, 200);
+  tft.setCursor(10, 108);
   tft.print("Then browse to:");
-  tft.setCursor(10, 220);
+  tft.setCursor(10, 122);
   tft.setTextColor(TFT_GREEN);
   tft.print("http://192.168.4.1");
 
@@ -630,6 +878,18 @@ unsigned long lastHAHistoryFetch = 0;
 const unsigned long HA_STATE_INTERVAL   = 30000;   // 30 seconds
 const unsigned long HA_HISTORY_INTERVAL = 600000;  // 10 minutes
 
+// Ring camera snapshot data
+struct RingCamData {
+  uint8_t *jpegBuf;      // PSRAM-allocated JPEG buffer
+  size_t   jpegLen;      // actual JPEG byte count
+  int      currentCam;   // index into RING_CAM_ENTITIES[]
+  bool     valid;        // true if jpegBuf has valid data
+} ringCamData = { nullptr, 0, 0, false };
+
+unsigned long lastRingCamFetch = 0;
+const unsigned long RING_CAM_INTERVAL = 60000;  // 60s refresh when paused on screen
+bool ringScreenWasActive = false;  // tracks transitions to Ring screen
+
 // --- HA Helper: fetch a single entity state ---
 bool fetchHAState(const char* entityId, char* state, size_t stateLen) {
   if (strlen(config.ha_url) == 0 || strlen(config.ha_token) == 0) return false;
@@ -654,6 +914,8 @@ bool fetchHAState(const char* entityId, char* state, size_t stateLen) {
 }
 
 // --- Batch state fetches for all HA screens ---
+void computeSumpTimeAgo(const char* isoTimestamp);  // forward declaration
+
 void fetchHAStates() {
   char buf[64];
 
@@ -876,21 +1138,103 @@ void fetchSumpHistory() {
   http.end();
 }
 
+// --- Ring camera snapshot fetch ---
+bool fetchRingSnapshot() {
+  if (strlen(config.ha_url) == 0 || strlen(config.ha_token) == 0) {
+    Serial.println("Ring: No HA URL or token configured");
+    return false;
+  }
+
+  // Allocate buffer on first call (try PSRAM first, fall back to heap)
+  if (ringCamData.jpegBuf == nullptr) {
+    ringCamData.jpegBuf = (uint8_t*)ps_malloc(65536);
+    if (ringCamData.jpegBuf == nullptr) {
+      Serial.println("Ring: PSRAM alloc failed, trying heap...");
+      ringCamData.jpegBuf = (uint8_t*)malloc(65536);
+    }
+    if (ringCamData.jpegBuf == nullptr) {
+      Serial.println("Ring: Buffer alloc failed!");
+      return false;
+    }
+    Serial.println("Ring: Buffer allocated OK");
+  }
+
+  HTTPClient http;
+  String url = String(config.ha_url) + "/api/camera_proxy/" + RING_CAM_ENTITIES[ringCamData.currentCam];
+  Serial.printf("Ring: Fetching %s\n", url.c_str());
+  http.begin(url);
+  http.addHeader("Authorization", String("Bearer ") + config.ha_token);
+  http.setTimeout(10000);
+
+  int code = http.GET();
+  bool ok = false;
+
+  if (code == 200) {
+    int len = http.getSize();
+    Serial.printf("Ring: HTTP 200, Content-Length: %d\n", len);
+
+    // Use getString() to get the full response, then memcpy
+    // This is simpler and more reliable than manual stream reading
+    WiFiClient *stream = http.getStreamPtr();
+    size_t bytesRead = 0;
+    size_t maxLen = 65536;
+    size_t toRead = (len > 0 && (size_t)len <= maxLen) ? (size_t)len : maxLen;
+
+    unsigned long start = millis();
+    while (bytesRead < toRead && millis() - start < 10000) {
+      if (stream->available()) {
+        size_t remain = toRead - bytesRead;
+        int avail = stream->available();
+        int chunk = (avail < (int)remain) ? avail : (int)remain;
+        int got = stream->readBytes(ringCamData.jpegBuf + bytesRead, chunk);
+        bytesRead += got;
+      } else if (!stream->connected()) {
+        break;  // server closed connection, we have what we have
+      } else {
+        delay(1);  // yield to avoid tight loop while waiting for data
+      }
+    }
+
+    if (bytesRead > 0) {
+      ringCamData.jpegLen = bytesRead;
+      ringCamData.valid = true;
+      ok = true;
+      Serial.printf("Ring: Got %s (%d bytes in %lums)\n",
+        RING_CAM_NAMES[ringCamData.currentCam], bytesRead, millis() - start);
+    } else {
+      Serial.println("Ring: No bytes received");
+    }
+  } else {
+    Serial.printf("Ring: HTTP %d for %s\n", code, RING_CAM_ENTITIES[ringCamData.currentCam]);
+  }
+
+  http.end();
+  return ok;
+}
+
 // ============================================================
 // DISPLAY SCREENS
 // ============================================================
 
-// Color palette
-#define CLR_BG       0x0000   // Black
-#define CLR_PRIMARY  0x5D7F   // Soft blue
-#define CLR_ACCENT   0xFE20   // Warm amber
-#define CLR_DIM      0x4228   // Dark gray
-#define CLR_TEXT     0xFFFF   // White
-#define CLR_GREEN    0x2E89   // Muted green
-#define CLR_WATER    0x04DF   // Water blue
-#define CLR_COFFEE   0x8A22   // Coffee brown
-#define CLR_COLD     0x001F   // Icy blue
-#define CLR_HOT      0xF800   // Red
+// TJpg_Decoder callback: render decoded JPEG blocks into sprite
+bool jpgDrawCallback(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
+  // Offset y by -5 to center 180px tall image in 170px display
+  int16_t ay = y - 5;
+  if (ay + (int16_t)h <= 0 || ay >= SCREEN_HEIGHT) return true;
+
+  for (int16_t row = 0; row < (int16_t)h; row++) {
+    int16_t sy = ay + row;
+    if (sy < 0 || sy >= SCREEN_HEIGHT) continue;
+    for (int16_t col = 0; col < (int16_t)w; col++) {
+      if (x + col < SCREEN_WIDTH) {
+        sprite.drawPixel(x + col, sy, bitmap[row * w + col]);
+      }
+    }
+  }
+  return true;
+}
+
+// (Color palette defined at top of file)
 
 void drawScreenClock() {
   sprite.fillSprite(CLR_BG);
@@ -899,129 +1243,224 @@ void drawScreenClock() {
   if (!getLocalTime(&timeinfo)) {
     sprite.setTextColor(TFT_RED);
     sprite.setTextSize(2);
-    sprite.drawString("No time sync", 20, 140);
+    int tw = sprite.textWidth("No time sync");
+    sprite.drawString("No time sync", (SCREEN_WIDTH - tw) / 2, 75);
     sprite.pushSprite(0, 0);
     return;
   }
 
-  // Time (large)
+  // Time — size 8 (48px wide × 64px tall per char), pseudo-bold
   char timeBuf[10];
   strftime(timeBuf, sizeof(timeBuf), "%I:%M", &timeinfo);
-  // Remove leading zero from hour
   char *timeStr = timeBuf;
   if (timeStr[0] == '0') timeStr++;
 
   sprite.setTextColor(CLR_TEXT);
-  sprite.setTextSize(4);
+  sprite.setTextSize(8);
   int tw = sprite.textWidth(timeStr);
-  sprite.drawString(timeStr, (SCREEN_WIDTH - tw) / 2, 90);
+  int timeX = (SCREEN_WIDTH - tw) / 2;
+  sprite.drawString(timeStr, timeX,     10);
+  sprite.drawString(timeStr, timeX + 1, 10);  // pseudo-bold
 
-  // AM/PM
-  char ampm[4];
-  strftime(ampm, sizeof(ampm), "%p", &timeinfo);
-  sprite.setTextSize(2);
-  sprite.setTextColor(CLR_DIM);
-  tw = sprite.textWidth(ampm);
-  sprite.drawString(ampm, (SCREEN_WIDTH - tw) / 2, 135);
+  // Divider
+  sprite.drawFastHLine(20, 84, SCREEN_WIDTH - 40, CLR_DIM);
 
-  // Seconds
+  // :SS and AM/PM centered on one row below time
   char secBuf[4];
   strftime(secBuf, sizeof(secBuf), ":%S", &timeinfo);
-  sprite.setTextSize(2);
+  char ampm[4];
+  strftime(ampm, sizeof(ampm), "%p", &timeinfo);
+  sprite.setTextSize(3);
+  int secW  = sprite.textWidth(secBuf);
+  int ampmW = sprite.textWidth(ampm);
+  int rowX  = (SCREEN_WIDTH - secW - 14 - ampmW) / 2;
   sprite.setTextColor(CLR_PRIMARY);
-  tw = sprite.textWidth(secBuf);
-  sprite.drawString(secBuf, (SCREEN_WIDTH - tw) / 2, 160);
-
-  // Date
-  char dateBuf[32];
-  strftime(dateBuf, sizeof(dateBuf), "%A", &timeinfo);
-  sprite.setTextSize(2);
-  sprite.setTextColor(CLR_ACCENT);
-  tw = sprite.textWidth(dateBuf);
-  sprite.drawString(dateBuf, (SCREEN_WIDTH - tw) / 2, 200);
-
-  strftime(dateBuf, sizeof(dateBuf), "%b %d, %Y", &timeinfo);
-  sprite.setTextSize(2);
+  sprite.drawString(secBuf, rowX, 93);
   sprite.setTextColor(CLR_DIM);
-  tw = sprite.textWidth(dateBuf);
-  sprite.drawString(dateBuf, (SCREEN_WIDTH - tw) / 2, 225);
+  sprite.drawString(ampm, rowX + secW + 14, 93);
 
-  // Decorative line
-  sprite.drawFastHLine(30, 80, 110, CLR_DIM);
-  sprite.drawFastHLine(30, 260, 110, CLR_DIM);
+  // Divider + date
+  sprite.drawFastHLine(20, 126, SCREEN_WIDTH - 40, CLR_DIM);
+
+  char dateBuf[48];
+  strftime(dateBuf, sizeof(dateBuf), "%A,  %B %d  %Y", &timeinfo);
+  sprite.setTextColor(CLR_ACCENT);
+  sprite.setTextSize(2);
+  tw = sprite.textWidth(dateBuf);
+  if (tw > SCREEN_WIDTH - 20) {
+    sprite.setTextSize(1);
+    tw = sprite.textWidth(dateBuf);
+  }
+  sprite.drawString(dateBuf, (SCREEN_WIDTH - tw) / 2, 137);
 
   sprite.pushSprite(0, 0);
+}
+
+// Draw a simple weather icon centered at (cx, cy), radius r
+// icon = OWM icon code e.g. "01d", "10n"
+void drawWeatherIcon(int cx, int cy, int r, const char* icon) {
+  char c0 = icon[0], c1 = icon[1];
+  const uint16_t CLR_CLOUD_C = 0xC618; // light gray — visible on dark background
+
+  // Fluffy cloud: 3 overlapping bumps + filled base, cr = approximate half-width
+  auto drawCloud = [&](int x, int y, int cr) {
+    int topR  = cr * 10 / 16;
+    int sideR = cr *  7 / 16;
+    sprite.fillCircle(x,           y - cr/4,  topR,  CLR_CLOUD_C);
+    sprite.fillCircle(x - cr*5/8,  y + cr/8,  sideR, CLR_CLOUD_C);
+    sprite.fillCircle(x + cr*5/8,  y + cr/8,  sideR, CLR_CLOUD_C);
+    sprite.fillRect(x - cr, y + cr/8 - sideR/2, cr * 2, sideR + cr/4 + 2, CLR_CLOUD_C);
+  };
+
+  if (c0 == '0' && c1 == '1') {
+    // Clear — large sun filling the icon area
+    int sr = r * 9 / 16;
+    sprite.fillCircle(cx, cy, sr, CLR_ACCENT);
+    for (int a = 0; a < 8; a++) {
+      float rad = a * 3.14159f / 4.0f;
+      float ca = cosf(rad), sa = sinf(rad);
+      // 3px-wide rays
+      for (int w = -1; w <= 1; w++) {
+        float pa = rad + 1.5708f;
+        int ox = (int)(w * cosf(pa)), oy = (int)(w * sinf(pa));
+        sprite.drawLine(cx + ox + (int)((sr + 5) * ca), cy + oy + (int)((sr + 5) * sa),
+                        cx + ox + (int)((sr + r/2) * ca), cy + oy + (int)((sr + r/2) * sa),
+                        CLR_ACCENT);
+      }
+    }
+
+  } else if (c0 == '0' && c1 == '2') {
+    // Few clouds — small sun peeking behind cloud
+    int sr = r / 4;
+    sprite.fillCircle(cx - r*3/8, cy - r/5, sr, CLR_ACCENT);
+    for (int a = 0; a < 8; a++) {
+      float rad = a * 3.14159f / 4.0f;
+      sprite.drawLine(cx - r*3/8 + (int)((sr + 2) * cosf(rad)),
+                      cy - r/5   + (int)((sr + 2) * sinf(rad)),
+                      cx - r*3/8 + (int)((sr + 5) * cosf(rad)),
+                      cy - r/5   + (int)((sr + 5) * sinf(rad)), CLR_ACCENT);
+    }
+    drawCloud(cx + r/8, cy + r/8, r * 5/8);
+
+  } else if ((c0 == '0' && (c1 == '3' || c1 == '4')) || (c0 == '5' && c1 == '0')) {
+    // Cloudy / mist — full-size cloud
+    drawCloud(cx, cy, r * 11/16);
+
+  } else if (c0 == '0' && c1 == '9') {
+    // Shower rain — cloud + 5 angled drops
+    drawCloud(cx, cy - r/5, r * 9/16);
+    for (int i = -2; i <= 2; i++) {
+      int rx = cx + i * (r / 4);
+      sprite.drawLine(rx,     cy + r*3/8, rx - 3, cy + r*11/16, CLR_WATER);
+      sprite.drawLine(rx + 1, cy + r*3/8, rx - 2, cy + r*11/16, CLR_WATER);
+    }
+
+  } else if (c0 == '1' && c1 == '0') {
+    // Rain — cloud + 5 longer drops
+    drawCloud(cx, cy - r/5, r * 9/16);
+    for (int i = -2; i <= 2; i++) {
+      int rx = cx + i * (r / 4);
+      sprite.drawLine(rx,     cy + r*3/8, rx - 5, cy + r*13/16, CLR_WATER);
+      sprite.drawLine(rx + 1, cy + r*3/8, rx - 4, cy + r*13/16, CLR_WATER);
+    }
+
+  } else if (c0 == '1' && c1 == '1') {
+    // Thunderstorm — cloud + bold lightning bolt
+    drawCloud(cx, cy - r/4, r * 9/16);
+    int bx = cx, by = cy + r/8;
+    sprite.fillTriangle(bx + r/5,  by,          bx - r/8,  by + r*6/16, bx + r/12, by + r*6/16, CLR_ACCENT);
+    sprite.fillTriangle(bx + r/12, by + r*4/16, bx - r/5,  by + r*11/16, bx + r/8, by + r*11/16, CLR_ACCENT);
+
+  } else if (c0 == '1' && c1 == '3') {
+    // Snow — cloud + 3 snowflake asterisks
+    drawCloud(cx, cy - r/5, r * 9/16);
+    for (int i = -1; i <= 1; i++) {
+      int sx = cx + i * (r * 3/8), sy = cy + r * 9/16;
+      int sr = r / 5;
+      sprite.drawFastHLine(sx - sr, sy, sr*2+1, CLR_TEXT);
+      sprite.drawFastVLine(sx, sy - sr, sr*2+1, CLR_TEXT);
+      sprite.drawLine(sx - sr*3/4, sy - sr*3/4, sx + sr*3/4, sy + sr*3/4, CLR_TEXT);
+      sprite.drawLine(sx + sr*3/4, sy - sr*3/4, sx - sr*3/4, sy + sr*3/4, CLR_TEXT);
+    }
+
+  } else {
+    sprite.drawCircle(cx, cy, r / 2, CLR_DIM);
+  }
 }
 
 void drawScreenWeather() {
   sprite.fillSprite(CLR_BG);
 
-  // Header
+  // Left panel: labels and details
   sprite.setTextColor(CLR_PRIMARY);
   sprite.setTextSize(2);
-  sprite.drawString("WEATHER", 20, 20);
+  sprite.drawString("WEATHER", 12, 10);
 
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString(config.weather_city, 20, 42);
+  sprite.drawString(config.weather_city, 12, 30);
 
-  sprite.drawFastHLine(20, 58, 130, CLR_DIM);
+  // Vertical divider
+  sprite.drawFastVLine(158, 8, 155, CLR_DIM);
 
   if (!weatherData.valid) {
     sprite.setTextColor(TFT_RED);
     sprite.setTextSize(2);
-    sprite.drawString("No data", 30, 140);
+    sprite.drawString("No data", 12, 70);
     sprite.setTextColor(CLR_DIM);
     sprite.setTextSize(1);
-    sprite.drawString("Check API key", 30, 165);
+    sprite.drawString("Check API key &", 12, 98);
+    sprite.drawString("web config", 12, 110);
     sprite.pushSprite(0, 0);
     return;
   }
 
-  // Temperature (large)
-  char tempBuf[10];
+  sprite.drawFastHLine(12, 42, 140, CLR_DIM);
+
+  // Description
+  char desc[64];
+  strlcpy(desc, weatherData.description, sizeof(desc));
+  if (desc[0] >= 'a' && desc[0] <= 'z') desc[0] -= 32;
+  sprite.setTextColor(CLR_ACCENT);
+  sprite.setTextSize(1);
+  sprite.drawString(desc, 12, 52);
+
+  // Feels like
+  char tempBuf[12];
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("Feels like", 12, 82);
+  sprite.setTextColor(CLR_TEXT);
+  sprite.setTextSize(2);
+  snprintf(tempBuf, sizeof(tempBuf), "%.0fF", weatherData.feels_like);
+  sprite.drawString(tempBuf, 12, 94);
+
+  // Humidity
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("Humidity", 12, 126);
+  sprite.setTextColor(CLR_TEXT);
+  sprite.setTextSize(2);
+  snprintf(tempBuf, sizeof(tempBuf), "%d%%", weatherData.humidity);
+  sprite.drawString(tempBuf, 12, 138);
+
+  // Right panel: temperature + icon
+  int rightCx = 158 + (SCREEN_WIDTH - 158) / 2;  // ~239
   snprintf(tempBuf, sizeof(tempBuf), "%.0f", weatherData.temp);
   sprite.setTextColor(CLR_TEXT);
   sprite.setTextSize(5);
   int tw = sprite.textWidth(tempBuf);
-  sprite.drawString(tempBuf, (SCREEN_WIDTH - tw) / 2 - 10, 80);
+  sprite.drawString(tempBuf, rightCx - tw / 2, 18);
 
-  // Degree symbol
+  // Degree + F
   sprite.setTextSize(2);
-  sprite.drawString("F", (SCREEN_WIDTH + tw) / 2 - 5, 82);
-
-  // Description
-  sprite.setTextColor(CLR_ACCENT);
-  sprite.setTextSize(2);
-  // Capitalize first letter
-  char desc[64];
-  strlcpy(desc, weatherData.description, sizeof(desc));
-  if (desc[0] >= 'a' && desc[0] <= 'z') desc[0] -= 32;
-  tw = sprite.textWidth(desc);
-  if (tw > SCREEN_WIDTH - 20) {
-    sprite.setTextSize(1);
-    tw = sprite.textWidth(desc);
-  }
-  sprite.drawString(desc, (SCREEN_WIDTH - tw) / 2, 150);
-
-  // Details
-  sprite.drawFastHLine(20, 185, 130, CLR_DIM);
-
   sprite.setTextColor(CLR_DIM);
-  sprite.setTextSize(1);
-  sprite.drawString("Feels like", 20, 200);
+  sprite.drawString("o", rightCx + tw / 2, 16);
   sprite.setTextColor(CLR_TEXT);
-  sprite.setTextSize(2);
-  snprintf(tempBuf, sizeof(tempBuf), "%.0fF", weatherData.feels_like);
-  sprite.drawString(tempBuf, 20, 215);
+  sprite.drawString("F", rightCx + tw / 2 + 14, 20);
 
-  sprite.setTextColor(CLR_DIM);
-  sprite.setTextSize(1);
-  sprite.drawString("Humidity", 100, 200);
-  sprite.setTextColor(CLR_TEXT);
-  sprite.setTextSize(2);
-  snprintf(tempBuf, sizeof(tempBuf), "%d%%", weatherData.humidity);
-  sprite.drawString(tempBuf, 100, 215);
+  // Weather icon below temperature
+  drawWeatherIcon(rightCx, 118, 38, weatherData.icon);
 
   sprite.pushSprite(0, 0);
 }
@@ -1031,39 +1470,53 @@ void drawScreenSports() {
 
   sprite.setTextColor(CLR_PRIMARY);
   sprite.setTextSize(2);
-  sprite.drawString("SCORES", 20, 20);
-  sprite.drawFastHLine(20, 42, 130, CLR_DIM);
+  sprite.drawString("SCORES", 12, 10);
+  sprite.drawFastHLine(12, 30, SCREEN_WIDTH - 24, CLR_DIM);
 
-  // Placeholder - replace with your preferred sports API
+  // Placeholder
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("Add a sports API", 20, 80);
-  sprite.drawString("in the code to", 20, 95);
-  sprite.drawString("show live scores", 20, 110);
+  sprite.drawString("Add a sports API in the code to show live scores", 12, 48);
 
   sprite.setTextColor(CLR_ACCENT);
-  sprite.setTextSize(2);
-  sprite.drawString("GO PACK GO", 20, 150);
+  sprite.setTextSize(3);
+  int tw = sprite.textWidth("GO PACK GO");
+  sprite.drawString("GO PACK GO", (SCREEN_WIDTH - tw) / 2, 72);
 
-  // Example layout for when you add real data:
-  sprite.drawFastHLine(20, 185, 130, CLR_DIM);
+  // Example layout
+  sprite.drawFastHLine(12, 120, SCREEN_WIDTH - 24, CLR_DIM);
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("Example layout:", 20, 195);
-
+  sprite.drawString("Example layout:", 12, 130);
   sprite.setTextColor(CLR_TEXT);
   sprite.setTextSize(2);
-  sprite.drawString("GB", 20, 215);
-  sprite.drawString("24", 70, 215);
-  sprite.drawString("CHI", 20, 240);
+  sprite.drawString("GB  24", 12, 145);
   sprite.setTextColor(CLR_DIM);
-  sprite.drawString("17", 70, 240);
-
+  sprite.drawString("CHI 17", 120, 145);
   sprite.setTextColor(CLR_GREEN);
   sprite.setTextSize(1);
-  sprite.drawString("FINAL", 110, 225);
+  sprite.drawString("FINAL", 240, 150);
 
   sprite.pushSprite(0, 0);
+}
+
+// Draw a "no HA data" error block — shows whether it's a config or fetch issue
+void drawHAError(int x, int y) {
+  sprite.setTextColor(TFT_RED);
+  sprite.setTextSize(2);
+  if (strlen(config.ha_url) == 0 || strlen(config.ha_token) == 0) {
+    sprite.drawString("HA not configured", x, y);
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Set HA URL + token", x, y + 20);
+    sprite.drawString("at " + String(WiFi.localIP().toString()), x, y + 32);
+  } else {
+    sprite.drawString("No data", x, y);
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Check token & entity ID", x, y + 20);
+    sprite.drawString(config.ha_url, x, y + 32);
+  }
 }
 
 // ============================================================
@@ -1072,81 +1525,60 @@ void drawScreenSports() {
 void drawScreenHumidity() {
   sprite.fillSprite(CLR_BG);
 
-  // Header
+  // Header (left side)
   sprite.setTextColor(CLR_PRIMARY);
   sprite.setTextSize(2);
-  sprite.drawString("HUMIDITY", 20, 20);
-  sprite.setTextColor(CLR_DIM);
-  sprite.setTextSize(1);
-  sprite.drawString("Bedroom", 20, 42);
-  sprite.drawFastHLine(20, 58, 130, CLR_DIM);
+  sprite.drawString("BEDROOM", 12, 10);
+  sprite.drawString("HUMIDITY", 12, 30);
+  sprite.drawFastHLine(12, 50, 100, CLR_DIM);
 
   if (!humidityData.valid) {
-    sprite.setTextColor(TFT_RED);
-    sprite.setTextSize(2);
-    sprite.drawString("No data", 30, 140);
-    sprite.setTextColor(CLR_DIM);
-    sprite.setTextSize(1);
-    sprite.drawString("Check HA config", 30, 165);
+    drawHAError(12, 72);
     sprite.pushSprite(0, 0);
     return;
   }
 
   float h = humidityData.humidity;
 
-  // Color based on humidity level
   uint16_t dropColor;
   const char* statusText;
   if (h < 30) {
-    dropColor = CLR_ACCENT;  // Orange = too dry
+    dropColor = CLR_ACCENT;
     statusText = "Too Dry";
   } else if (h <= 60) {
-    dropColor = CLR_WATER;   // Blue = comfortable
+    dropColor = CLR_WATER;
     statusText = "Comfortable";
   } else {
-    dropColor = 0x0410;      // Dark teal = too humid
+    dropColor = 0x0410;
     statusText = "Too Humid";
   }
 
-  // --- Water droplet icon ---
-  int cx = 85;  // center X
-  int bulbY = 130;
+  // --- Water droplet (left side) ---
+  int cx = 65;
+  int bulbY = 105;
   int bulbR = 22;
-  int tipY = 80;
+  int tipY = 55;
 
-  // Droplet body (filled circle + triangle)
   sprite.fillCircle(cx, bulbY, bulbR, dropColor);
   sprite.fillTriangle(cx - bulbR, bulbY, cx + bulbR, bulbY, cx, tipY, dropColor);
 
-  // Water level inside droplet (animated waves)
-  // Fill level based on humidity: 0% = bottom of bulb, 100% = top of droplet
   int fillTop = bulbY + bulbR - (int)((h / 100.0f) * (bulbY + bulbR - tipY));
   float phase = millis() / 300.0f;
 
-  // Draw animated wave lines inside the droplet
   for (int wy = fillTop; wy <= bulbY + bulbR; wy++) {
-    // Compute the horizontal extent of the droplet at this Y
     int halfWidth;
     if (wy >= bulbY - bulbR && wy <= bulbY + bulbR) {
-      // In the circle portion
       float dy = (float)(wy - bulbY);
       halfWidth = (int)sqrtf(bulbR * bulbR - dy * dy);
     } else if (wy < bulbY && wy >= tipY) {
-      // In the triangle portion
       float t = (float)(wy - tipY) / (float)(bulbY - tipY);
       halfWidth = (int)(t * bulbR);
     } else {
       continue;
     }
-
-    // Wave offset
-    float wave = sinf(phase + wy * 0.15f) * 2.0f;
-    int x1 = cx - halfWidth + 1;
-    int x2 = cx + halfWidth - 1;
-
-    // Only draw the fill below the wave surface
     if (wy == fillTop) {
-      // Draw the wave surface line
+      int x1 = cx - halfWidth + 1;
+      int x2 = cx + halfWidth - 1;
       for (int px = x1; px <= x2; px++) {
         float waveAtPx = sinf(phase + px * 0.08f) * 3.0f;
         if (wy + (int)waveAtPx <= fillTop + 2) {
@@ -1156,31 +1588,27 @@ void drawScreenHumidity() {
     }
   }
 
-  // Droplet outline (slightly brighter)
   sprite.drawCircle(cx, bulbY, bulbR, CLR_TEXT);
-  // Triangle outline edges
   sprite.drawLine(cx - bulbR, bulbY, cx, tipY, CLR_TEXT);
   sprite.drawLine(cx + bulbR, bulbY, cx, tipY, CLR_TEXT);
-
-  // Small shine highlight on droplet
   sprite.fillCircle(cx - 8, bulbY - 10, 3, CLR_TEXT);
 
-  // --- Large humidity value ---
+  // Vertical divider
+  sprite.drawFastVLine(115, 45, 118, CLR_DIM);
+
+  // --- Right side: humidity value ---
+  int rightCx = 115 + (SCREEN_WIDTH - 115) / 2;  // ~218
   sprite.setTextColor(CLR_TEXT);
-  sprite.setTextSize(4);
+  sprite.setTextSize(5);
   char humBuf[10];
   snprintf(humBuf, sizeof(humBuf), "%.0f%%", h);
   int tw = sprite.textWidth(humBuf);
-  sprite.drawString(humBuf, (SCREEN_WIDTH - tw) / 2, 175);
+  sprite.drawString(humBuf, rightCx - tw / 2, 52);
 
-  // --- Status text ---
   sprite.setTextColor(dropColor);
   sprite.setTextSize(2);
   tw = sprite.textWidth(statusText);
-  sprite.drawString(statusText, (SCREEN_WIDTH - tw) / 2, 225);
-
-  // Decorative line
-  sprite.drawFastHLine(30, 260, 110, CLR_DIM);
+  sprite.drawString(statusText, rightCx - tw / 2, 118);
 
   sprite.pushSprite(0, 0);
 }
@@ -1191,37 +1619,29 @@ void drawScreenHumidity() {
 void drawScreenEspresso() {
   sprite.fillSprite(CLR_BG);
 
-  // Header
+  // Header (left panel)
   sprite.setTextColor(CLR_PRIMARY);
   sprite.setTextSize(2);
-  sprite.drawString("ESPRESSO", 20, 20);
+  sprite.drawString("ESPRESSO", 12, 10);
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("De'Longhi Micra", 20, 42);
-  sprite.drawFastHLine(20, 58, 130, CLR_DIM);
+  sprite.drawString("La Marzocco Linea Micra", 12, 30);
+  sprite.drawFastHLine(12, 42, 105, CLR_DIM);
 
   if (!espressoData.stateValid) {
-    sprite.setTextColor(TFT_RED);
-    sprite.setTextSize(2);
-    sprite.drawString("No data", 30, 140);
-    sprite.setTextColor(CLR_DIM);
-    sprite.setTextSize(1);
-    sprite.drawString("Check HA config", 30, 165);
+    drawHAError(12, 72);
     sprite.pushSprite(0, 0);
     return;
   }
 
-  // --- Coffee cup graphic ---
-  int cupX = 55, cupY = 85;
-  int cupW = 50, cupH = 40;
+  // --- Coffee cup graphic (left side) ---
+  int cupX = 18, cupY = 68;
+  int cupW = 55, cupH = 45;
 
-  // Cup body
   sprite.fillRoundRect(cupX, cupY, cupW, cupH, 4, CLR_COFFEE);
-  // Cup rim highlight
   sprite.drawFastHLine(cupX, cupY, cupW, CLR_ACCENT);
   sprite.drawFastHLine(cupX, cupY + 1, cupW, CLR_ACCENT);
 
-  // Handle (right side)
   for (int a = -40; a <= 40; a++) {
     float rad = a * 3.14159f / 180.0f;
     int hx = cupX + cupW + (int)(10 * cosf(rad));
@@ -1230,19 +1650,15 @@ void drawScreenEspresso() {
     sprite.drawPixel(hx + 1, hy, CLR_COFFEE);
   }
 
-  // Saucer
-  sprite.fillRoundRect(cupX - 10, cupY + cupH + 2, cupW + 20, 6, 3, CLR_DIM);
-
-  // Coffee fill inside cup
-  int fillH = cupH - 8;
-  sprite.fillRect(cupX + 3, cupY + 6, cupW - 6, fillH, 0x4100);  // dark coffee color
+  sprite.fillRoundRect(cupX - 8, cupY + cupH + 2, cupW + 16, 5, 3, CLR_DIM);
+  sprite.fillRect(cupX + 3, cupY + 6, cupW - 6, cupH - 10, 0x4100);
 
   // --- Animated steam ---
   float t = millis() / 200.0f;
   for (int s = 0; s < 3; s++) {
-    int baseX = cupX + 10 + s * 15;
-    for (int y = cupY - 5; y > cupY - 25; y--) {
-      float age = (float)(cupY - 5 - y) / 20.0f;  // 0 at bottom, 1 at top
+    int baseX = cupX + 8 + s * 16;
+    for (int y = cupY - 5; y > cupY - 22; y--) {
+      float age = (float)(cupY - 5 - y) / 18.0f;
       float wave = sinf(t + y * 0.25f + s * 1.5f) * (2.0f + age * 3.0f);
       // Fade out as steam rises
       uint16_t steamColor = (age < 0.5f) ? CLR_DIM : 0x2104;
@@ -1251,41 +1667,41 @@ void drawScreenEspresso() {
     }
   }
 
-  // --- Total coffees (large) ---
+  // Vertical divider
+  sprite.drawFastVLine(120, 45, 118, CLR_DIM);
+
+  // --- Right side: total coffees ---
+  int rightX = 135;
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("Total coffees", rightX, 52);
+
   sprite.setTextColor(CLR_TEXT);
   sprite.setTextSize(4);
   char totalBuf[10];
   snprintf(totalBuf, sizeof(totalBuf), "%d", espressoData.totalCoffees);
-  int tw = sprite.textWidth(totalBuf);
-  sprite.drawString(totalBuf, (SCREEN_WIDTH - tw) / 2, 155);
-
-  sprite.setTextColor(CLR_DIM);
-  sprite.setTextSize(1);
-  tw = sprite.textWidth("total coffees");
-  sprite.drawString("total coffees", (SCREEN_WIDTH - tw) / 2, 195);
+  sprite.drawString(totalBuf, rightX, 64);
 
   // --- Yesterday's shots ---
-  sprite.drawFastHLine(30, 215, 110, CLR_DIM);
-
+  sprite.drawFastHLine(rightX, 110, SCREEN_WIDTH - rightX - 12, CLR_DIM);
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("Yesterday", 20, 230);
+  sprite.drawString("Yesterday", rightX, 118);
 
   if (espressoData.historyValid) {
     sprite.setTextColor(CLR_ACCENT);
     sprite.setTextSize(3);
     char yBuf[16];
     snprintf(yBuf, sizeof(yBuf), "%d", espressoData.yesterdayShots);
-    sprite.drawString(yBuf, 20, 248);
-
+    sprite.drawString(yBuf, rightX, 132);
     sprite.setTextColor(CLR_DIM);
     sprite.setTextSize(1);
     const char* shotLabel = (espressoData.yesterdayShots == 1) ? "shot" : "shots";
-    sprite.drawString(shotLabel, 20 + sprite.textWidth(yBuf) * 3 + 8, 258);
+    sprite.drawString(shotLabel, rightX + sprite.textWidth(yBuf) * 3 + 6, 142);
   } else {
     sprite.setTextColor(CLR_DIM);
     sprite.setTextSize(1);
-    sprite.drawString("loading...", 20, 250);
+    sprite.drawString("loading...", rightX, 135);
   }
 
   sprite.pushSprite(0, 0);
@@ -1300,26 +1716,20 @@ void drawScreenBackyard() {
   // Header
   sprite.setTextColor(CLR_PRIMARY);
   sprite.setTextSize(2);
-  sprite.drawString("BACKYARD", 20, 20);
+  sprite.drawString("BACKYARD", 12, 10);
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("Temperature", 20, 42);
-  sprite.drawFastHLine(20, 58, 130, CLR_DIM);
+  sprite.drawString("Temperature", 12, 30);
+  sprite.drawFastHLine(12, 42, 58, CLR_DIM);
 
   if (!backyardData.valid) {
-    sprite.setTextColor(TFT_RED);
-    sprite.setTextSize(2);
-    sprite.drawString("No data", 30, 140);
-    sprite.setTextColor(CLR_DIM);
-    sprite.setTextSize(1);
-    sprite.drawString("Check HA config", 30, 165);
+    drawHAError(12, 72);
     sprite.pushSprite(0, 0);
     return;
   }
 
   float temp = backyardData.temperature;
 
-  // Color based on temperature
   uint16_t tempColor;
   const char* statusText;
   if (temp <= 32) {
@@ -1339,62 +1749,59 @@ void drawScreenBackyard() {
     statusText = "Hot";
   }
 
-  // --- Thermometer graphic (left side) ---
-  int thX = 30;     // center X of thermometer
-  int thTop = 75;   // top of tube
-  int thBot = 185;  // bottom of tube (where bulb starts)
-  int tubeW = 8;    // half-width of tube
-  int bulbR = 16;   // bulb radius
+  // --- Thermometer (left side), fits within 170px height ---
+  int thX = 35;
+  int thTop = 22;
+  int thBot = 138;
+  int tubeW = 8;
+  int bulbR = 14;
 
-  // Tube outline
   sprite.fillRect(thX - tubeW, thTop, tubeW * 2, thBot - thTop, CLR_DIM);
   sprite.fillCircle(thX, thBot, bulbR, CLR_DIM);
 
-  // Mercury fill
-  // Map temp: -20F = empty, 120F = full
   float fillPct = constrain((temp + 20.0f) / 140.0f, 0.0f, 1.0f);
   int mercuryTop = thBot - (int)(fillPct * (thBot - thTop - 4));
   sprite.fillRect(thX - tubeW + 3, mercuryTop, tubeW * 2 - 6, thBot - mercuryTop, tempColor);
   sprite.fillCircle(thX, thBot, bulbR - 4, tempColor);
 
-  // Tube outline border
   sprite.drawRect(thX - tubeW, thTop, tubeW * 2, thBot - thTop, CLR_TEXT);
   sprite.drawCircle(thX, thBot, bulbR, CLR_TEXT);
 
-  // Scale marks
   for (int i = 0; i <= 4; i++) {
     int markY = thTop + 4 + i * ((thBot - thTop - 8) / 4);
-    sprite.drawFastHLine(thX + tubeW + 2, markY, 6, CLR_DIM);
+    sprite.drawFastHLine(thX + tubeW + 2, markY, 5, CLR_DIM);
   }
 
-  // Temperature labels on scale
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
   sprite.drawString("120", thX + tubeW + 10, thTop + 2);
-  sprite.drawString("0", thX + tubeW + 10, thBot - 8);
+  sprite.drawString("0", thX + tubeW + 10, thBot - 12);
+
+  // Vertical divider
+  sprite.drawFastVLine(78, 45, 118, CLR_DIM);
 
   // --- Large temperature value (right side) ---
-  sprite.setTextColor(CLR_TEXT);
-  sprite.setTextSize(5);
   char tempBuf[10];
   snprintf(tempBuf, sizeof(tempBuf), "%.0f", temp);
+  sprite.setTextColor(CLR_TEXT);
+  sprite.setTextSize(6);
   int tw = sprite.textWidth(tempBuf);
-  sprite.drawString(tempBuf, 75, 110);
+  sprite.drawString(tempBuf, 92, 38);
 
   // Degree + F
   sprite.setTextSize(2);
   sprite.setTextColor(CLR_DIM);
-  sprite.drawString("o", 75 + tw * 5 / 4 + 2, 105);
+  sprite.drawString("o", 92 + tw + 2, 36);
   sprite.setTextColor(CLR_TEXT);
-  sprite.drawString("F", 75 + tw * 5 / 4 + 14, 110);
+  sprite.drawString("F", 92 + tw + 16, 42);
 
-  // --- Status text ---
+  // Status
+  sprite.drawFastHLine(85, 100, SCREEN_WIDTH - 97, CLR_DIM);
   sprite.setTextColor(tempColor);
-  sprite.setTextSize(2);
+  sprite.setTextSize(3);
+  int rightCx = 78 + (SCREEN_WIDTH - 78) / 2;
   tw = sprite.textWidth(statusText);
-  sprite.drawString(statusText, (SCREEN_WIDTH - tw) / 2, 230);
-
-  sprite.drawFastHLine(30, 260, 110, CLR_DIM);
+  sprite.drawString(statusText, rightCx - tw / 2, 112);
 
   sprite.pushSprite(0, 0);
 }
@@ -1408,101 +1815,88 @@ void drawScreenSump() {
   // Header
   sprite.setTextColor(CLR_PRIMARY);
   sprite.setTextSize(2);
-  sprite.drawString("SUMP PUMP", 15, 20);
-  sprite.drawFastHLine(15, 42, 140, CLR_DIM);
+  sprite.drawString("SUMP PUMP", 12, 10);
+  sprite.drawFastHLine(12, 30, SCREEN_WIDTH - 24, CLR_DIM);
 
   if (!sumpData.stateValid) {
-    sprite.setTextColor(TFT_RED);
-    sprite.setTextSize(2);
-    sprite.drawString("No data", 30, 140);
-    sprite.setTextColor(CLR_DIM);
-    sprite.setTextSize(1);
-    sprite.drawString("Check HA config", 30, 165);
+    drawHAError(12, 55);
     sprite.pushSprite(0, 0);
     return;
   }
 
-  // --- Pump icon (simple) ---
-  // Small pipe/pump graphic
-  sprite.fillRect(20, 55, 8, 20, CLR_PRIMARY);        // vertical pipe
-  sprite.fillRect(20, 55, 25, 6, CLR_PRIMARY);         // horizontal pipe top
-  sprite.fillRoundRect(40, 58, 16, 14, 3, CLR_ACCENT); // pump body
-  sprite.fillRect(56, 62, 12, 6, CLR_PRIMARY);         // output pipe
+  // --- Pump icon ---
+  sprite.fillRect(12, 38, 6, 16, CLR_PRIMARY);
+  sprite.fillRect(12, 38, 20, 5, CLR_PRIMARY);
+  sprite.fillRoundRect(28, 40, 14, 12, 3, CLR_ACCENT);
+  sprite.fillRect(42, 44, 10, 5, CLR_PRIMARY);
 
   // --- 24-hour run count ---
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("Last 24 Hours", 80, 55);
-
+  sprite.drawString("Last 24h", 60, 36);
   sprite.setTextColor(CLR_TEXT);
   sprite.setTextSize(3);
   char countBuf[10];
   snprintf(countBuf, sizeof(countBuf), "%d", sumpData.runsLast24h);
-  sprite.drawString(countBuf, 80, 68);
-
+  sprite.drawString(countBuf, 60, 48);
   int cw = sprite.textWidth(countBuf);
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString(sumpData.runsLast24h == 1 ? "run" : "runs", 80 + cw * 3 + 8, 78);
+  sprite.drawString(sumpData.runsLast24h == 1 ? "run" : "runs", 60 + cw * 3 + 5, 57);
 
-  // --- Last run time ---
+  // --- Last run time (right of divider) ---
+  sprite.drawFastVLine(160, 32, 50, CLR_DIM);
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  char lastBuf[40];
-  snprintf(lastBuf, sizeof(lastBuf), "Last run: %s", sumpData.lastRunTime);
-  sprite.drawString(lastBuf, 15, 100);
+  sprite.drawString("Last run", 170, 36);
+  sprite.setTextColor(CLR_TEXT);
+  sprite.setTextSize(2);
+  sprite.drawString(sumpData.lastRunTime, 170, 50);
 
   // --- 7-Day Bar Chart ---
-  sprite.drawFastHLine(15, 120, 140, CLR_DIM);
+  sprite.drawFastHLine(12, 88, SCREEN_WIDTH - 24, CLR_DIM);
   sprite.setTextColor(CLR_PRIMARY);
   sprite.setTextSize(1);
-  sprite.drawString("7-Day History", 15, 128);
+  sprite.drawString("7-Day History", 12, 93);
 
   if (!sumpData.historyValid) {
     sprite.setTextColor(CLR_DIM);
     sprite.setTextSize(1);
-    sprite.drawString("Loading history...", 15, 180);
+    sprite.drawString("Loading history...", 12, 130);
     sprite.pushSprite(0, 0);
     return;
   }
 
   int chartX = 12;
-  int chartY = 145;
-  int chartH = 130;
-  int barW = 16;
-  int gap = 4;
+  int chartY = 104;
+  int chartH = 50;
+  int barW = 32;
+  int gap = 8;
 
-  // Find max for scaling
   int maxVal = 1;
   for (int i = 0; i < 7; i++) {
     if (sumpData.dailyRuns[i] > maxVal) maxVal = sumpData.dailyRuns[i];
   }
 
-  // Baseline
   sprite.drawFastHLine(chartX, chartY + chartH, 7 * (barW + gap), CLR_DIM);
 
-  // Get day-of-week names
   struct tm timeinfo;
   getLocalTime(&timeinfo);
 
   for (int i = 0; i < 7; i++) {
-    int dayIdx = 6 - i;  // 6=oldest on left, 0=today on right
+    int dayIdx = 6 - i;
     int x = chartX + i * (barW + gap);
     int barH = 0;
     if (maxVal > 0) {
-      barH = (sumpData.dailyRuns[dayIdx] * (chartH - 20)) / maxVal;
+      barH = (sumpData.dailyRuns[dayIdx] * (chartH - 12)) / maxVal;
     }
-    if (sumpData.dailyRuns[dayIdx] > 0 && barH < 4) barH = 4;  // min visible height
+    if (sumpData.dailyRuns[dayIdx] > 0 && barH < 4) barH = 4;
 
-    // Bar color: today = accent, others = primary
     uint16_t color = (dayIdx == 0) ? CLR_ACCENT : CLR_PRIMARY;
-
     if (barH > 0) {
       sprite.fillRect(x, chartY + chartH - barH, barW, barH, color);
     }
 
-    // Day label below baseline
-    // Compute day of week for this bar
     time_t now_t = mktime(&timeinfo);
     time_t dayT = now_t - dayIdx * 86400;
     struct tm dayTm;
@@ -1510,23 +1904,60 @@ void drawScreenSump() {
     const char* dayNames[] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
     sprite.setTextColor((dayIdx == 0) ? CLR_ACCENT : CLR_DIM);
     sprite.setTextSize(1);
-    sprite.drawString(dayNames[dayTm.tm_wday], x + 1, chartY + chartH + 4);
+    sprite.drawString(dayNames[dayTm.tm_wday], x + barW / 2 - 4, chartY + chartH + 3);
 
-    // Count above bar (if > 0)
     if (sumpData.dailyRuns[dayIdx] > 0) {
       char cStr[4];
       snprintf(cStr, sizeof(cStr), "%d", sumpData.dailyRuns[dayIdx]);
       sprite.setTextColor(CLR_TEXT);
       sprite.setTextSize(1);
-      sprite.drawString(cStr, x + 3, chartY + chartH - barH - 12);
+      sprite.drawString(cStr, x + barW / 2 - 3, chartY + chartH - barH - 10);
     }
   }
 
-  // "Today" indicator
-  sprite.setTextColor(CLR_ACCENT);
+  sprite.pushSprite(0, 0);
+}
+
+// ============================================================
+// RING CAMERA SNAPSHOT SCREEN
+// ============================================================
+void drawScreenRingCam() {
+  sprite.fillSprite(CLR_BG);
+
+  if (!ringCamData.valid || ringCamData.jpegBuf == nullptr) {
+    sprite.setTextColor(CLR_PRIMARY);
+    sprite.setTextSize(2);
+    sprite.drawString("RING CAMERAS", 12, 10);
+    sprite.drawFastHLine(12, 30, 140, CLR_DIM);
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Waiting for snapshot...", 12, 50);
+    sprite.pushSprite(0, 0);
+    return;
+  }
+
+  // Decode JPEG at 1/2 scale directly into sprite via callback
+  TJpgDec.drawJpg(0, 0, ringCamData.jpegBuf, ringCamData.jpegLen);
+
+  // Semi-transparent dark bar at bottom for camera name
+  for (int y = SCREEN_HEIGHT - 22; y < SCREEN_HEIGHT; y++) {
+    for (int x = 0; x < SCREEN_WIDTH; x++) {
+      uint16_t orig = sprite.readPixel(x, y);
+      sprite.drawPixel(x, y, (orig >> 1) & 0x7BEF);  // 50% darken
+    }
+  }
+
+  // Camera name centered
+  sprite.setTextColor(CLR_TEXT);
   sprite.setTextSize(1);
-  int todayX = chartX + 6 * (barW + gap);
-  sprite.drawString("^", todayX + 5, chartY + chartH + 14);
+  const char* name = RING_CAM_NAMES[ringCamData.currentCam];
+  int16_t tw = sprite.textWidth(name);
+  sprite.drawString(name, (SCREEN_WIDTH - tw) / 2, SCREEN_HEIGHT - 16);
+
+  // Camera index indicator (e.g. "3/5")
+  char idxBuf[8];
+  snprintf(idxBuf, sizeof(idxBuf), "%d/%d", ringCamData.currentCam + 1, RING_CAM_COUNT);
+  sprite.drawString(idxBuf, SCREEN_WIDTH - sprite.textWidth(idxBuf) - 4, SCREEN_HEIGHT - 16);
 
   sprite.pushSprite(0, 0);
 }
@@ -1539,43 +1970,117 @@ void drawScreenIP() {
 
   sprite.setTextColor(CLR_PRIMARY);
   sprite.setTextSize(2);
-  sprite.drawString("NETWORK", 20, 20);
-  sprite.drawFastHLine(20, 42, 130, CLR_DIM);
+  sprite.drawString("NETWORK", 12, 10);
+  sprite.drawFastHLine(12, 30, SCREEN_WIDTH - 24, CLR_DIM);
+
+  // Left column
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  sprite.drawString("WiFi Network", 12, 42);
+  sprite.setTextColor(CLR_TEXT);
+  sprite.setTextSize(2);
+  sprite.drawString(config.wifi_ssid, 12, 53);
 
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("IP Address", 20, 70);
+  sprite.drawString("IP Address", 12, 76);
   sprite.setTextColor(CLR_TEXT);
   sprite.setTextSize(2);
-  sprite.drawString(WiFi.localIP().toString(), 20, 85);
+  sprite.drawString(WiFi.localIP().toString(), 12, 87);
 
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("Signal Strength", 20, 120);
+  sprite.drawString("Signal", 12, 112);
   sprite.setTextColor(CLR_TEXT);
-  sprite.setTextSize(2);
+  sprite.setTextSize(1);
   char rssi[16];
   snprintf(rssi, sizeof(rssi), "%d dBm", WiFi.RSSI());
-  sprite.drawString(rssi, 20, 135);
+  sprite.drawString(rssi, 12, 122);
 
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("Web Config", 20, 180);
-  sprite.setTextColor(CLR_GREEN);
-  sprite.setTextSize(1);
+  sprite.drawString("Free heap: " + String(ESP.getFreeHeap()), 12, 130);
+
+  // Right column
+  sprite.drawFastVLine(170, 32, 130, CLR_DIM);
   String configUrl = "http://" + WiFi.localIP().toString();
-  sprite.drawString(configUrl, 20, 195);
 
   sprite.setTextColor(CLR_DIM);
   sprite.setTextSize(1);
-  sprite.drawString("OTA Update", 20, 225);
+  sprite.drawString("Web Config", 180, 42);
   sprite.setTextColor(CLR_GREEN);
-  sprite.drawString(configUrl + "/update", 20, 240);
+  sprite.drawString(configUrl, 180, 54);
 
   sprite.setTextColor(CLR_DIM);
-  sprite.drawString("Free heap: " + String(ESP.getFreeHeap()), 20, 280);
+  sprite.drawString("OTA Update", 180, 84);
+  sprite.setTextColor(CLR_GREEN);
+  sprite.drawString(configUrl + "/update", 180, 96);
 
   sprite.pushSprite(0, 0);
+}
+
+// Show the saved WiFi scan log from NVS (recorded on last failed connection)
+void drawWifiLogScreen() {
+  prefs.begin("wifilog", true);
+  int cnt = prefs.getInt("wl_cnt", 0);
+  prefs.end();
+
+  sprite.fillSprite(CLR_BG);
+  sprite.setTextColor(CLR_PRIMARY);
+  sprite.setTextSize(2);
+  sprite.drawString("WIFI LOG", 12, 10);
+  sprite.drawFastHLine(12, 30, SCREEN_WIDTH - 24, CLR_DIM);
+
+  if (cnt == 0) {
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("No scan log saved yet.", 12, 55);
+    sprite.drawString("Log is recorded when WiFi", 12, 70);
+    sprite.drawString("connection fails.", 12, 82);
+    sprite.pushSprite(0, 0);
+    delay(6000);
+    return;
+  }
+
+  sprite.setTextColor(CLR_ACCENT);
+  sprite.setTextSize(1);
+  sprite.drawString(String("Target: ") + config.wifi_ssid, 12, 32);
+
+  // Load and display all saved networks
+  const int ROW_H = 20;
+  const int HDR_H = 44;
+
+  prefs.begin("wifilog", true);
+  for (int i = 0; i < cnt; i++) {
+    char keyS[10], keyB[10], keyR[10];
+    snprintf(keyS, sizeof(keyS), "wl%dssid", i);
+    snprintf(keyB, sizeof(keyB), "wl%dbssid", i);
+    snprintf(keyR, sizeof(keyR), "wl%drssi", i);
+
+    String ssid   = prefs.getString(keyS, "");
+    String bssid  = prefs.getString(keyB, "");
+    int    rssi   = prefs.getInt(keyR, 0);
+
+    bool isTarget = (ssid == String(config.wifi_ssid));
+    int y = HDR_H + i * ROW_H;
+
+    // SSID + RSSI
+    if (ssid.length() == 0) ssid = "(hidden)";
+    if (ssid.length() > 22) ssid = ssid.substring(0, 21) + "~";
+    char row1[52];
+    snprintf(row1, sizeof(row1), "%-22s %d dBm", ssid.c_str(), rssi);
+    sprite.setTextColor(isTarget ? CLR_GREEN : CLR_TEXT);
+    sprite.setTextSize(1);
+    sprite.drawString(row1, 12, y);
+
+    // BSSID
+    sprite.setTextColor(isTarget ? CLR_PRIMARY : CLR_DIM);
+    sprite.drawString(bssid, 12, y + 10);
+  }
+  prefs.end();
+
+  sprite.pushSprite(0, 0);
+  delay(12000);  // show for 12 seconds
 }
 
 // ============================================================
@@ -1597,6 +2102,7 @@ Screen allScreens[] = {
   { drawScreenEspresso, &config.screen_espresso },
   { drawScreenBackyard, &config.screen_backyard },
   { drawScreenSump,     &config.screen_sump },
+  { drawScreenRingCam,  &config.screen_ring },
 };
 const int NUM_SCREENS = sizeof(allScreens) / sizeof(Screen);
 
@@ -1621,12 +2127,16 @@ void setup() {
 
   // Initialize display
   tft.init();
-  tft.setRotation(0);  // Portrait, USB-C at bottom
+  tft.setRotation(3);  // Landscape, USB-C on left
   tft.fillScreen(TFT_BLACK);
 
   // Create sprite (double-buffered drawing = no flicker)
   sprite.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT);
   sprite.setTextWrap(false);
+
+  // JPEG decoder for camera snapshots
+  TJpgDec.setJpgScale(2);  // 1/2 scale: 640x360 -> 320x180
+  TJpgDec.setCallback(jpgDrawCallback);
 
   // Buttons
   pinMode(BTN_LEFT, INPUT_PULLUP);
@@ -1639,10 +2149,10 @@ void setup() {
   if (strlen(config.wifi_ssid) > 0) {
     if (connectWiFi()) {
       setupTime();
-      fetchWeather();
-      fetchHAStates();
-      fetchEspressoHistory();
-      fetchSumpHistory();
+      // Data fetches happen in loop() on first iteration — avoids blocking setup
+      // and hanging on the "WiFi Connected" splash screen
+    } else {
+      startAPMode();  // WiFi failed — fall back to AP so user can reconfigure
     }
   } else {
     startAPMode();
@@ -1687,10 +2197,11 @@ void loop() {
       lastScreenChange = now;
       lastBtnTime = now;
     }
-    // Both buttons held: show network info
+    // Both buttons held: show network info then saved WiFi scan log
     if (btnLeft == LOW && btnRight == LOW) {
       drawScreenIP();
       delay(5000);
+      drawWifiLogScreen();
       lastScreenChange = now;
       lastBtnTime = now;
     }
@@ -1706,19 +2217,35 @@ void loop() {
 
   // --- Periodic data fetches ---
   if (WiFi.status() == WL_CONNECTED) {
-    if (now - lastWeatherFetch >= WEATHER_INTERVAL) {
+    if (lastWeatherFetch == 0 || now - lastWeatherFetch >= WEATHER_INTERVAL) {
       fetchWeather();
       lastWeatherFetch = now;
     }
-    if (now - lastHAStateFetch >= HA_STATE_INTERVAL) {
+    if (lastHAStateFetch == 0 || now - lastHAStateFetch >= HA_STATE_INTERVAL) {
       fetchHAStates();
       lastHAStateFetch = now;
     }
-    if (now - lastHAHistoryFetch >= HA_HISTORY_INTERVAL) {
+    if (lastHAHistoryFetch == 0 || now - lastHAHistoryFetch >= HA_HISTORY_INTERVAL) {
       fetchEspressoHistory();
       fetchSumpHistory();
       lastHAHistoryFetch = now;
     }
+    // Ring camera: advance + fetch on each transition to this screen
+    bool ringIsActive = config.screen_ring &&
+                        allScreens[currentScreen].draw == drawScreenRingCam;
+    if (ringIsActive && !ringScreenWasActive) {
+      // Just transitioned TO Ring screen — advance and fetch
+      if (lastRingCamFetch != 0) {
+        ringCamData.currentCam = (ringCamData.currentCam + 1) % RING_CAM_COUNT;
+      }
+      fetchRingSnapshot();
+      lastRingCamFetch = now;
+    } else if (ringIsActive && now - lastRingCamFetch >= RING_CAM_INTERVAL) {
+      // Paused on Ring screen — periodic refresh of same camera
+      fetchRingSnapshot();
+      lastRingCamFetch = now;
+    }
+    ringScreenWasActive = ringIsActive;
   }
 
   // --- Draw current screen ---

@@ -18,15 +18,17 @@ An Arduino project for the **Lilygo T-Display S3** (ESP32-S3 + 1.9" ST7789 170×
 - **ElegantOTA** — web-based firmware updates at `/update`
 - **Preferences** — persistent key-value config storage in NVMe flash
 - **HTTPClient** — outbound API calls (weather, Home Assistant, etc.)
+- **TJpg_Decoder** — JPEG decoding for camera snapshots (renders into TFT_eSprite)
 
 ## Architecture
 
 ### Screen System
 Each display screen is a `void drawScreenXxx()` function that draws into the `sprite` (TFT_eSprite) and calls `sprite.pushSprite(0, 0)` at the end. Screens are registered in the `allScreens[]` array with a pointer to their draw function and a pointer to their enable/disable bool in the config struct.
 
-**Current screens (7 total):**
+**Current screens (8 total):**
 - Clock, Weather, Sports (standalone)
 - Bedroom Humidity, Espresso Stats, Backyard Temp, Sump Pump (Home Assistant)
+- Ring Cameras (HA camera_proxy — cycles through 5 snapshot cameras)
 
 **HA screens use hardcoded entity IDs** (`#define HA_ENTITY_*`) rather than configurable fields, since each screen has custom graphics and data parsing specific to its sensor.
 
@@ -46,6 +48,7 @@ API calls happen on intervals in the main `loop()`:
 - Weather: every 5 minutes (`WEATHER_INTERVAL`)
 - HA current states: every 30 seconds (`HA_STATE_INTERVAL`) — humidity, espresso total, backyard temp, sump last cycle
 - HA history: every 10 minutes (`HA_HISTORY_INTERVAL`) — espresso yesterday shots, sump 7-day bar chart
+- Ring camera snapshots: every 30 seconds (`RING_CAM_INTERVAL`) — JPEG from HA camera_proxy, advances to next camera each fetch
 - Time: NTP auto-sync on boot
 
 The `fetchHAState()` helper fetches a single entity's state and is reused by `fetchHAStates()` which batches all 4 HA entity lookups. History API calls (`fetchEspressoHistory()`, `fetchSumpHistory()`) use `/api/history/period/{start}` with `minimal_response&no_attributes` to keep response sizes small.
