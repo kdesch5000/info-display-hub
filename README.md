@@ -11,6 +11,7 @@ A WiFi-connected rotating info display with OTA updates and web-based configurat
 - **Backyard Temperature** — Thermometer graphic with color-coded temp reading (Home Assistant)
 - **Sump Pump Monitor** — 24h run count, time since last run, 7-day bar chart (Home Assistant + History API)
 - **Ring Cameras** — Cycles through 5 Ring camera snapshots via HA camera_proxy (Home Assistant)
+- **Now Brewing** — Coffee name + bag image from roaster website (JPEG/PNG, HTTPS supported)
 
 ## Hardware
 - Lilygo T-Display S3 (~$15–20)
@@ -38,6 +39,7 @@ A WiFi-connected rotating info display with OTA updates and web-based configurat
 Install these via **Sketch → Include Library → Manage Libraries**:
 - **TFT_eSPI** by Bodmer
 - **TJpg_Decoder** by Bodmer
+- **PNGdec** by Larry Bank
 - **ArduinoJson** by Benoit Blanchon
 - **ElegantOTA** by Ayush Sharma
 

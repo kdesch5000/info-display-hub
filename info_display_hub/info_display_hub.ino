@@ -1,4 +1,4 @@
-// v2.5 - 2026-03-24 - Add Ring camera snapshot screen
+// v2.6 - 2026-03-24 - Add Now Brewing coffee screen
 /*
  * Info Display Hub - Lilygo T-Display S3
  * =======================================
@@ -11,6 +11,7 @@
  *   - Backyard Temperature (HA sensor with thermometer graphic)
  *   - Sump Pump Monitor (HA sensor with 7-day bar chart)
  *   - Ring Camera Snapshots (HA camera_proxy, cycles through cameras)
+ *   - Now Brewing (coffee name + roaster image via URL)
  *   - OTA firmware updates (web-based)
  *   - Web configuration portal
  *
@@ -23,6 +24,7 @@
  *   - ESPAsyncWebServer (https://github.com/me-no-dev/ESPAsyncWebServer)
  *   - ElegantOTA (by Ayush Sharma)
  *   - TJpg_Decoder (by Bodmer)
+ *   - PNGdec (by Larry Bank)
  *
  * Board setup in Arduino IDE:
  *   1. Add ESP32 board package via Board Manager
@@ -32,6 +34,7 @@
  */
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <time.h>
 #include <Preferences.h>
@@ -42,6 +45,7 @@
 #include <ElegantOTA.h>
 #include <math.h>
 #include <TJpg_Decoder.h>
+#include <PNGdec.h>
 
 // ============================================================
 // COLOR PALETTE (defined early so all functions can use them)
@@ -119,6 +123,9 @@ struct Config {
   bool screen_backyard;
   bool screen_sump;
   bool screen_ring;
+  bool screen_brewing;
+  char coffee_name[64];
+  char coffee_img[256];     // URL to JPEG image of coffee bag
 } config;
 
 void loadConfig() {
@@ -139,6 +146,9 @@ void loadConfig() {
   config.screen_backyard = prefs.getBool("scr_backyd", false);
   config.screen_sump     = prefs.getBool("scr_sump", false);
   config.screen_ring     = prefs.getBool("scr_ring", false);
+  config.screen_brewing  = prefs.getBool("scr_brew", false);
+  strlcpy(config.coffee_name,    prefs.getString("cof_name", "").c_str(),    sizeof(config.coffee_name));
+  strlcpy(config.coffee_img,     prefs.getString("cof_img", "").c_str(),     sizeof(config.coffee_img));
   prefs.end();
 }
 
@@ -160,6 +170,9 @@ void saveConfig() {
   prefs.putBool("scr_backyd",     config.screen_backyard);
   prefs.putBool("scr_sump",       config.screen_sump);
   prefs.putBool("scr_ring",       config.screen_ring);
+  prefs.putBool("scr_brew",       config.screen_brewing);
+  prefs.putString("cof_name",     config.coffee_name);
+  prefs.putString("cof_img",      config.coffee_img);
   prefs.end();
 }
 
@@ -376,6 +389,21 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
         <span>Ring Cameras</span>
         <label class="toggle"><input type="checkbox" name="scr_ring" id="scr_ring"><span class="slider"></span></label>
       </div>
+
+      <p class="section-label">Coffee Screen</p>
+      <div class="toggle-row">
+        <span>Now Brewing</span>
+        <label class="toggle"><input type="checkbox" name="scr_brewing" id="scr_brewing"><span class="slider"></span></label>
+      </div>
+      <label>Coffee Name</label>
+      <input type="text" name="coffee_name" id="coffee_name" placeholder="Ethiopian Yirgacheffe">
+      <label>Coffee Image URL</label>
+      <input type="text" name="coffee_img" id="coffee_img" placeholder="https://roaster.com/bag.jpg" oninput="updateCoffeePreview()">
+      <p class="hint">Direct link to a JPEG or PNG image of the coffee bag</p>
+      <div id="coffeePreview" style="margin-top:10px;text-align:center;display:none;">
+        <img id="coffeePreviewImg" style="max-width:200px;max-height:200px;border-radius:8px;border:1px solid #2a2d3a;" />
+        <p id="coffeePreviewStatus" style="color:#555;font-size:0.78em;margin-top:4px;"></p>
+      </div>
     </div>
 
     <button type="submit" class="btn">Save &amp; Reboot</button>
@@ -392,6 +420,19 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 </div>
 
 <script>
+  function updateCoffeePreview() {
+    var url = document.getElementById('coffee_img').value.trim();
+    var preview = document.getElementById('coffeePreview');
+    var img = document.getElementById('coffeePreviewImg');
+    var status = document.getElementById('coffeePreviewStatus');
+    if (!url) { preview.style.display='none'; return; }
+    preview.style.display='block';
+    status.textContent='Loading...';
+    img.onload = function() { status.textContent=img.naturalWidth+'x'+img.naturalHeight+' — OK'; };
+    img.onerror = function() { status.textContent='Failed to load image'; };
+    img.src = url;
+  }
+
   // Load current config on page load
   fetch('/api/config').then(r=>r.json()).then(c=>{
     document.getElementById('wifi_ssid').value = c.wifi_ssid || '';
@@ -410,6 +451,10 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
     document.getElementById('scr_backyard').checked = c.scr_backyard;
     document.getElementById('scr_sump').checked = c.scr_sump;
     document.getElementById('scr_ring').checked = c.scr_ring;
+    document.getElementById('scr_brewing').checked = c.scr_brewing;
+    document.getElementById('coffee_name').value = c.coffee_name || '';
+    document.getElementById('coffee_img').value = c.coffee_img || '';
+    updateCoffeePreview();
   });
 
   document.getElementById('configForm').addEventListener('submit', function(e) {
@@ -432,6 +477,9 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
       scr_backyard: document.getElementById('scr_backyard').checked,
       scr_sump: document.getElementById('scr_sump').checked,
       scr_ring: document.getElementById('scr_ring').checked,
+      scr_brewing: document.getElementById('scr_brewing').checked,
+      coffee_name: document.getElementById('coffee_name').value,
+      coffee_img: document.getElementById('coffee_img').value,
     };
     fetch('/api/config', {
       method: 'POST',
@@ -507,6 +555,9 @@ void setupWebServer() {
     doc["scr_backyard"] = config.screen_backyard;
     doc["scr_sump"]     = config.screen_sump;
     doc["scr_ring"]     = config.screen_ring;
+    doc["scr_brewing"]  = config.screen_brewing;
+    doc["coffee_name"]  = config.coffee_name;
+    doc["coffee_img"]   = config.coffee_img;
     String json;
     serializeJson(doc, json);
     request->send(200, "application/json", json);
@@ -533,6 +584,9 @@ void setupWebServer() {
       config.screen_backyard = obj["scr_backyard"]  | false;
       config.screen_sump     = obj["scr_sump"]      | false;
       config.screen_ring     = obj["scr_ring"]      | false;
+      config.screen_brewing  = obj["scr_brewing"]   | false;
+      strlcpy(config.coffee_name,     obj["coffee_name"] | "",     sizeof(config.coffee_name));
+      strlcpy(config.coffee_img,      obj["coffee_img"] | "",      sizeof(config.coffee_img));
 
       saveConfig();
       request->send(200, "application/json", "{\"status\":\"ok\"}");
@@ -890,6 +944,23 @@ unsigned long lastRingCamFetch = 0;
 const unsigned long RING_CAM_INTERVAL = 60000;  // 60s refresh when paused on screen
 bool ringScreenWasActive = false;  // tracks transitions to Ring screen
 
+// Now Brewing coffee image data
+struct BrewingData {
+  uint8_t *imgBuf;
+  size_t   imgLen;
+  uint16_t imgW, imgH;     // decoded dimensions (after scaling)
+  uint8_t  scale;           // scale factor used (JPEG: 1/2/4/8, PNG: computed)
+  bool     valid;
+  bool     isPng;           // true=PNG, false=JPEG
+} brewingData = { nullptr, 0, 0, 0, 1, false, false };
+
+PNG png;  // PNGdec instance for coffee image
+
+unsigned long lastBrewingFetch = 0;
+const unsigned long BREWING_INTERVAL = 600000;  // 10 min refresh
+bool brewingScreenWasActive = false;
+char lastBrewingUrl[256] = "";  // detect URL changes
+
 // --- HA Helper: fetch a single entity state ---
 bool fetchHAState(const char* entityId, char* state, size_t stateLen) {
   if (strlen(config.ha_url) == 0 || strlen(config.ha_token) == 0) return false;
@@ -1212,26 +1283,169 @@ bool fetchRingSnapshot() {
   return ok;
 }
 
+// --- Now Brewing image fetch ---
+bool fetchBrewingImage() {
+  if (strlen(config.coffee_img) == 0) return false;
+
+  // Allocate buffer on first call (384KB for large PNG images, PSRAM only)
+  if (brewingData.imgBuf == nullptr) {
+    brewingData.imgBuf = (uint8_t*)ps_malloc(393216);
+    if (brewingData.imgBuf == nullptr) {
+      Serial.println("Brew: PSRAM alloc failed for 384KB!");
+      brewingData.imgBuf = (uint8_t*)ps_malloc(131072);  // try 128KB fallback
+    }
+    if (brewingData.imgBuf == nullptr) {
+      Serial.println("Brew: Buffer alloc failed!");
+      return false;
+    }
+  }
+
+  HTTPClient http;
+  Serial.printf("Brew: Fetching %s\n", config.coffee_img);
+
+  // Support HTTPS URLs (skip certificate verification for simplicity)
+  WiFiClientSecure *secureClient = nullptr;
+  if (strncmp(config.coffee_img, "https", 5) == 0) {
+    secureClient = new WiFiClientSecure();
+    secureClient->setInsecure();  // skip cert verification
+    http.begin(*secureClient, config.coffee_img);
+  } else {
+    http.begin(config.coffee_img);
+  }
+  http.setTimeout(10000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.addHeader("User-Agent", "ESP32-InfoDisplay/1.0");
+
+  int code = http.GET();
+  bool ok = false;
+
+  if (code == 200) {
+    int len = http.getSize();
+    Serial.printf("Brew: HTTP 200, Content-Length: %d\n", len);
+
+    WiFiClient *stream = http.getStreamPtr();
+    size_t bytesRead = 0;
+    size_t maxLen = 393216;  // 384KB
+    size_t toRead = (len > 0 && (size_t)len <= maxLen) ? (size_t)len : maxLen;
+
+    unsigned long start = millis();
+    while (bytesRead < toRead && millis() - start < 15000) {
+      if (stream->available()) {
+        size_t remain = toRead - bytesRead;
+        int avail = stream->available();
+        int chunk = (avail < (int)remain) ? avail : (int)remain;
+        int got = stream->readBytes(brewingData.imgBuf + bytesRead, chunk);
+        bytesRead += got;
+      } else if (!stream->connected()) {
+        break;
+      } else {
+        delay(1);
+      }
+    }
+
+    if (bytesRead > 0) {
+      brewingData.imgLen = bytesRead;
+
+      // Detect format by magic bytes (PNG: 0x89504E47, JPEG: 0xFFD8)
+      bool isPng = (bytesRead >= 4 && brewingData.imgBuf[0] == 0x89 &&
+                    brewingData.imgBuf[1] == 0x50 && brewingData.imgBuf[2] == 0x4E &&
+                    brewingData.imgBuf[3] == 0x47);
+      brewingData.isPng = isPng;
+
+      uint16_t rawW = 0, rawH = 0;
+      if (isPng) {
+        // PNG: read dimensions from IHDR chunk (bytes 16-23)
+        if (bytesRead >= 24) {
+          rawW = (brewingData.imgBuf[16] << 24) | (brewingData.imgBuf[17] << 16) |
+                 (brewingData.imgBuf[18] << 8) | brewingData.imgBuf[19];
+          rawH = (brewingData.imgBuf[20] << 24) | (brewingData.imgBuf[21] << 16) |
+                 (brewingData.imgBuf[22] << 8) | brewingData.imgBuf[23];
+        }
+        Serial.printf("Brew: PNG %dx%d (%d bytes)\n", rawW, rawH, bytesRead);
+      } else {
+        TJpgDec.getJpgSize(&rawW, &rawH, brewingData.imgBuf, brewingData.imgLen);
+        Serial.printf("Brew: JPEG %dx%d (%d bytes)\n", rawW, rawH, bytesRead);
+      }
+
+      // Pick scale to fit in 150x170 area
+      if (rawW <= 150 && rawH <= 170) {
+        brewingData.scale = 1;
+      } else if (rawW <= 300 && rawH <= 340) {
+        brewingData.scale = 2;
+      } else if (rawW <= 600 && rawH <= 680) {
+        brewingData.scale = 4;
+      } else {
+        brewingData.scale = 8;
+      }
+      brewingData.imgW = rawW / brewingData.scale;
+      brewingData.imgH = rawH / brewingData.scale;
+      brewingData.valid = true;
+      ok = true;
+      Serial.printf("Brew: Scale 1/%d -> %dx%d (%s)\n",
+        brewingData.scale, brewingData.imgW, brewingData.imgH, isPng ? "PNG" : "JPEG");
+    } else {
+      Serial.println("Brew: No bytes received");
+    }
+  } else {
+    Serial.printf("Brew: HTTP %d\n", code);
+  }
+
+  http.end();
+  if (secureClient) delete secureClient;
+  strlcpy(lastBrewingUrl, config.coffee_img, sizeof(lastBrewingUrl));
+  return ok;
+}
+
 // ============================================================
 // DISPLAY SCREENS
 // ============================================================
 
+// Global offset for JPEG decode callback positioning
+int16_t jpgOffsetX = 0, jpgOffsetY = 0;
+
 // TJpg_Decoder callback: render decoded JPEG blocks into sprite
+// Uses jpgOffsetX/Y globals for positioning (set before calling drawJpg)
 bool jpgDrawCallback(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
-  // Offset y by -5 to center 180px tall image in 170px display
-  int16_t ay = y - 5;
+  int16_t ax = x + jpgOffsetX;
+  int16_t ay = y + jpgOffsetY;
   if (ay + (int16_t)h <= 0 || ay >= SCREEN_HEIGHT) return true;
+  if (ax + (int16_t)w <= 0 || ax >= SCREEN_WIDTH) return true;
 
   for (int16_t row = 0; row < (int16_t)h; row++) {
     int16_t sy = ay + row;
     if (sy < 0 || sy >= SCREEN_HEIGHT) continue;
     for (int16_t col = 0; col < (int16_t)w; col++) {
-      if (x + col < SCREEN_WIDTH) {
-        sprite.drawPixel(x + col, sy, bitmap[row * w + col]);
+      int16_t sx = ax + col;
+      if (sx >= 0 && sx < SCREEN_WIDTH) {
+        sprite.drawPixel(sx, sy, bitmap[row * w + col]);
       }
     }
   }
   return true;
+}
+
+// PNGdec callback: render decoded PNG lines into sprite
+// Uses jpgOffsetX/Y globals and brewingData.scale for positioning/scaling
+int pngDrawCallback(PNGDRAW *pDraw) {
+  uint16_t lineBuffer[320];  // max width we'd ever draw
+  int scale = brewingData.scale;
+  if (pDraw->y % scale != 0) return 1;  // skip rows for scaling
+
+  int16_t sy = (pDraw->y / scale) + jpgOffsetY;
+  if (sy < 0 || sy >= SCREEN_HEIGHT) return 1;
+
+  // Decode the PNG line to RGB565
+  png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
+
+  // Draw scaled pixels
+  int srcW = pDraw->iWidth;
+  for (int srcX = 0; srcX < srcW; srcX += scale) {
+    int16_t sx = (srcX / scale) + jpgOffsetX;
+    if (sx >= 0 && sx < SCREEN_WIDTH) {
+      sprite.drawPixel(sx, sy, lineBuffer[srcX]);
+    }
+  }
+  return 1;  // continue decoding
 }
 
 // (Color palette defined at top of file)
@@ -1919,6 +2133,84 @@ void drawScreenSump() {
 }
 
 // ============================================================
+// NOW BREWING COFFEE SCREEN
+// ============================================================
+void drawScreenBrewing() {
+  sprite.fillSprite(CLR_BG);
+
+  // Right side: text content
+  const int SPLIT_X = 155;  // divider position
+
+  // "NOW BREWING" header
+  sprite.setTextColor(CLR_ACCENT);
+  sprite.setTextSize(2);
+  sprite.drawString("NOW", SPLIT_X + 8, 12);
+  sprite.drawString("BREWING", SPLIT_X + 8, 34);
+
+  // Divider line
+  sprite.drawFastVLine(SPLIT_X - 2, 8, SCREEN_HEIGHT - 16, CLR_DIM);
+
+  // Coffee name (word-wrapped, large text)
+  sprite.setTextColor(CLR_TEXT);
+  sprite.setTextSize(2);
+  if (strlen(config.coffee_name) > 0) {
+    String name = String(config.coffee_name);
+    int16_t lineY = 68;
+    int16_t maxW = SCREEN_WIDTH - SPLIT_X - 12;
+    while (name.length() > 0 && lineY < SCREEN_HEIGHT - 8) {
+      int len = name.length();
+      while (len > 0 && sprite.textWidth(name.substring(0, len).c_str()) > maxW) {
+        int sp = name.lastIndexOf(' ', len - 1);
+        if (sp > 0) {
+          len = sp;
+        } else {
+          len--;
+        }
+      }
+      if (len <= 0) len = 1;
+      sprite.drawString(name.substring(0, len).c_str(), SPLIT_X + 8, lineY);
+      name = name.substring(len);
+      name.trim();
+      lineY += 22;  // line height for size 2
+    }
+  } else {
+    sprite.setTextColor(CLR_DIM);
+    sprite.drawString("No coffee set", SPLIT_X + 8, 68);
+  }
+
+  // Left side: coffee bag image
+  if (brewingData.valid && brewingData.imgBuf != nullptr) {
+    // Center image in the left half (0 to SPLIT_X-4)
+    int16_t areaW = SPLIT_X - 4;
+    int16_t cx = (areaW - (int16_t)brewingData.imgW) / 2;
+    int16_t cy = (SCREEN_HEIGHT - (int16_t)brewingData.imgH) / 2;
+    if (cx < 0) cx = 0;
+    if (cy < 0) cy = 0;
+
+    jpgOffsetX = cx;
+    jpgOffsetY = cy;
+
+    if (brewingData.isPng) {
+      int rc = png.openRAM(brewingData.imgBuf, brewingData.imgLen, pngDrawCallback);
+      if (rc == PNG_SUCCESS) {
+        png.decode(NULL, 0);
+        png.close();
+      }
+    } else {
+      TJpgDec.setJpgScale(brewingData.scale);
+      TJpgDec.drawJpg(0, 0, brewingData.imgBuf, brewingData.imgLen);
+    }
+  } else if (strlen(config.coffee_img) > 0) {
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Loading", 40, 78);
+    sprite.drawString("image...", 40, 92);
+  }
+
+  sprite.pushSprite(0, 0);
+}
+
+// ============================================================
 // RING CAMERA SNAPSHOT SCREEN
 // ============================================================
 void drawScreenRingCam() {
@@ -1937,6 +2229,10 @@ void drawScreenRingCam() {
   }
 
   // Decode JPEG at 1/2 scale directly into sprite via callback
+  // Set offsets: center 320x180 decoded image in 320x170 display (crop 5px top/bottom)
+  jpgOffsetX = 0;
+  jpgOffsetY = -5;
+  TJpgDec.setJpgScale(2);
   TJpgDec.drawJpg(0, 0, ringCamData.jpegBuf, ringCamData.jpegLen);
 
   // Semi-transparent dark bar at bottom for camera name
@@ -2103,6 +2399,7 @@ Screen allScreens[] = {
   { drawScreenBackyard, &config.screen_backyard },
   { drawScreenSump,     &config.screen_sump },
   { drawScreenRingCam,  &config.screen_ring },
+  { drawScreenBrewing,  &config.screen_brewing },
 };
 const int NUM_SCREENS = sizeof(allScreens) / sizeof(Screen);
 
@@ -2246,6 +2543,19 @@ void loop() {
       lastRingCamFetch = now;
     }
     ringScreenWasActive = ringIsActive;
+
+    // Now Brewing: fetch on screen transition, URL change, or periodic refresh
+    bool brewIsActive = config.screen_brewing &&
+                        allScreens[currentScreen].draw == drawScreenBrewing;
+    bool urlChanged = strcmp(config.coffee_img, lastBrewingUrl) != 0;
+    if (brewIsActive && (!brewingScreenWasActive || urlChanged)) {
+      fetchBrewingImage();
+      lastBrewingFetch = now;
+    } else if (brewIsActive && now - lastBrewingFetch >= BREWING_INTERVAL) {
+      fetchBrewingImage();
+      lastBrewingFetch = now;
+    }
+    brewingScreenWasActive = brewIsActive;
   }
 
   // --- Draw current screen ---

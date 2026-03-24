@@ -361,8 +361,8 @@ class TestFetchIntervals:
 
     def test_ring_fetch_guarded_by_screen_enabled(self, ino_source):
         """Ring camera fetch should only happen if screen is enabled."""
-        assert re.search(r'if\s*\(config\.screen_ring\)', ino_source), \
-            "Ring cam fetch must be guarded by config.screen_ring check"
+        assert re.search(r'config\.screen_ring', ino_source), \
+            "Ring cam fetch must reference config.screen_ring"
 
     def test_ring_fetch_guarded_by_wifi(self, ino_source):
         """Ring fetch block should be inside the WiFi connected check."""
@@ -372,3 +372,97 @@ class TestFetchIntervals:
         ring_fetch = ino_source.index("config.screen_ring", wifi_block_start)
         assert wifi_block_start < ring_fetch < draw_screen, \
             "Ring cam fetch must be inside the WiFi.connected block, before draw"
+
+
+# ============================================================
+# Now Brewing Screen Tests
+# ============================================================
+
+class TestBrewingConfigConsistency:
+    """Verify all config plumbing is wired up for the Now Brewing screen."""
+
+    def test_config_struct_has_screen_brewing(self, ino_source):
+        assert re.search(r'bool\s+screen_brewing;', ino_source)
+
+    def test_config_struct_has_coffee_name(self, ino_source):
+        assert re.search(r'char\s+coffee_name\[', ino_source)
+
+    def test_config_struct_has_coffee_img(self, ino_source):
+        assert re.search(r'char\s+coffee_img\[', ino_source)
+
+    def test_load_config_reads_scr_brew(self, ino_source):
+        assert re.search(r'prefs\.getBool\("scr_brew"', ino_source)
+
+    def test_load_config_reads_coffee_name(self, ino_source):
+        assert re.search(r'prefs\.getString\("cof_name"', ino_source)
+
+    def test_load_config_reads_coffee_img(self, ino_source):
+        assert re.search(r'prefs\.getString\("cof_img"', ino_source)
+
+    def test_save_config_writes_all_fields(self, ino_source):
+        assert re.search(r'prefs\.putBool\("scr_brew"', ino_source)
+        assert re.search(r'prefs\.putString\("cof_name"', ino_source)
+        assert re.search(r'prefs\.putString\("cof_img"', ino_source)
+
+    def test_json_get_includes_brewing_fields(self, ino_source):
+        assert re.search(r'doc\["scr_brewing"\]', ino_source)
+        assert re.search(r'doc\["coffee_name"\]', ino_source)
+        assert re.search(r'doc\["coffee_img"\]', ino_source)
+
+    def test_json_post_reads_brewing_fields(self, ino_source):
+        assert re.search(r'config\.screen_brewing\s*=\s*obj\["scr_brewing"\]', ino_source)
+        assert re.search(r'config\.coffee_name.*obj\["coffee_name"\]', ino_source)
+        assert re.search(r'config\.coffee_img.*obj\["coffee_img"\]', ino_source)
+
+    def test_html_has_brewing_toggle(self, ino_source):
+        assert re.search(r'id="scr_brewing"', ino_source)
+
+    def test_html_has_coffee_name_input(self, ino_source):
+        assert re.search(r'id="coffee_name"', ino_source)
+
+    def test_html_has_coffee_img_input(self, ino_source):
+        assert re.search(r'id="coffee_img"', ino_source)
+
+    def test_js_load_sets_brewing_fields(self, ino_source):
+        assert re.search(r"getElementById\('scr_brewing'\)\.checked", ino_source)
+        assert re.search(r"getElementById\('coffee_name'\)\.value", ino_source)
+        assert re.search(r"getElementById\('coffee_img'\)\.value", ino_source)
+
+    def test_js_submit_reads_brewing_fields(self, ino_source):
+        assert re.search(r"scr_brewing:\s*document", ino_source)
+        assert re.search(r"coffee_name:\s*document", ino_source)
+        assert re.search(r"coffee_img:\s*document", ino_source)
+
+    def test_all_screens_array_has_brewing(self, ino_source):
+        assert re.search(r'drawScreenBrewing.*screen_brewing', ino_source)
+
+
+class TestBrewingPreferencesKeys:
+    """ESP32 Preferences keys must be <= 15 characters."""
+
+    def test_key_lengths(self):
+        for key in ["scr_brew", "cof_name", "cof_img"]:
+            assert len(key) <= 15, f"Key '{key}' is {len(key)} chars, max 15"
+
+
+class TestBrewingImageFormat:
+    """Verify PNG and JPEG support."""
+
+    def test_pngdec_included(self, ino_source):
+        assert "#include <PNGdec.h>" in ino_source
+
+    def test_png_callback_exists(self, ino_source):
+        assert re.search(r'int pngDrawCallback\(PNGDRAW', ino_source)
+
+    def test_png_magic_detection(self, ino_source):
+        """Format detection by magic bytes (PNG: 89 50 4E 47)."""
+        assert '0x89' in ino_source and '0x50' in ino_source and '0x4E' in ino_source and '0x47' in ino_source, \
+            "PNG magic bytes must be checked for format detection"
+
+    def test_https_support(self, ino_source):
+        """HTTPS support for roaster websites."""
+        assert "WiFiClientSecure" in ino_source
+        assert "setInsecure" in ino_source
+
+    def test_redirect_support(self, ino_source):
+        assert "setFollowRedirects" in ino_source

@@ -19,16 +19,19 @@ An Arduino project for the **Lilygo T-Display S3** (ESP32-S3 + 1.9" ST7789 170×
 - **Preferences** — persistent key-value config storage in NVMe flash
 - **HTTPClient** — outbound API calls (weather, Home Assistant, etc.)
 - **TJpg_Decoder** — JPEG decoding for camera snapshots (renders into TFT_eSprite)
+- **PNGdec** — PNG decoding for coffee bag images
+- **WiFiClientSecure** — HTTPS support for external image URLs
 
 ## Architecture
 
 ### Screen System
 Each display screen is a `void drawScreenXxx()` function that draws into the `sprite` (TFT_eSprite) and calls `sprite.pushSprite(0, 0)` at the end. Screens are registered in the `allScreens[]` array with a pointer to their draw function and a pointer to their enable/disable bool in the config struct.
 
-**Current screens (8 total):**
+**Current screens (9 total):**
 - Clock, Weather, Sports (standalone)
 - Bedroom Humidity, Espresso Stats, Backyard Temp, Sump Pump (Home Assistant)
 - Ring Cameras (HA camera_proxy — cycles through 5 snapshot cameras)
+- Now Brewing (coffee name + roaster image from URL, JPEG/PNG via HTTPS)
 
 **HA screens use hardcoded entity IDs** (`#define HA_ENTITY_*`) rather than configurable fields, since each screen has custom graphics and data parsing specific to its sensor.
 
