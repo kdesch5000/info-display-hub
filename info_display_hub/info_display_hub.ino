@@ -1392,7 +1392,7 @@ bool fetchBrewingImage() {
 
   http.end();
   if (secureClient) delete secureClient;
-  strlcpy(lastBrewingUrl, config.coffee_img, sizeof(lastBrewingUrl));
+  if (ok) strlcpy(lastBrewingUrl, config.coffee_img, sizeof(lastBrewingUrl));
   return ok;
 }
 
@@ -1426,8 +1426,11 @@ bool jpgDrawCallback(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bit
 
 // PNGdec callback: render decoded PNG lines into sprite
 // Uses jpgOffsetX/Y globals and brewingData.scale for positioning/scaling
+// Static buffer sized for large source PNGs (scaled down during rendering)
+static uint16_t pngLineBuffer[1024];  // supports source PNGs up to 1024px wide
+
 int pngDrawCallback(PNGDRAW *pDraw) {
-  uint16_t lineBuffer[320];  // max width we'd ever draw
+  if (pDraw->iWidth > 1024) return 1;  // skip lines wider than our buffer
   int scale = brewingData.scale;
   if (pDraw->y % scale != 0) return 1;  // skip rows for scaling
 
@@ -1435,14 +1438,14 @@ int pngDrawCallback(PNGDRAW *pDraw) {
   if (sy < 0 || sy >= SCREEN_HEIGHT) return 1;
 
   // Decode the PNG line to RGB565
-  png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
+  png.getLineAsRGB565(pDraw, pngLineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
 
   // Draw scaled pixels
   int srcW = pDraw->iWidth;
   for (int srcX = 0; srcX < srcW; srcX += scale) {
     int16_t sx = (srcX / scale) + jpgOffsetX;
     if (sx >= 0 && sx < SCREEN_WIDTH) {
-      sprite.drawPixel(sx, sy, lineBuffer[srcX]);
+      sprite.drawPixel(sx, sy, pngLineBuffer[srcX]);
     }
   }
   return 1;  // continue decoding
