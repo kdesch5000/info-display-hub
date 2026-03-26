@@ -48,6 +48,25 @@
 #include <PNGdec.h>
 
 // ============================================================
+// DEBUG LOG RING BUFFER — accessible via /api/log
+// ============================================================
+#define LOG_LINES 40
+#define LOG_LINE_LEN 120
+char logRing[LOG_LINES][LOG_LINE_LEN];
+int logHead = 0;
+int logCount = 0;
+
+void logMsg(const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(logRing[logHead], LOG_LINE_LEN, fmt, args);
+  va_end(args);
+  Serial.println(logRing[logHead]);
+  logHead = (logHead + 1) % LOG_LINES;
+  if (logCount < LOG_LINES) logCount++;
+}
+
+// ============================================================
 // COLOR PALETTE (defined early so all functions can use them)
 // ============================================================
 #define CLR_BG       0x0000   // Black
@@ -948,18 +967,84 @@ bool ringScreenWasActive = false;  // tracks transitions to Ring screen
 struct BrewingData {
   uint8_t *imgBuf;
   size_t   imgLen;
-  uint16_t imgW, imgH;     // decoded dimensions (after scaling)
-  uint8_t  scale;           // scale factor used (JPEG: 1/2/4/8, PNG: computed)
+  size_t   bufSize;          // actual allocated buffer size
+  uint16_t imgW, imgH;       // decoded dimensions (after scaling)
+  uint8_t  scale;            // scale factor used (JPEG: 1/2/4/8, PNG: computed)
   bool     valid;
-  bool     isPng;           // true=PNG, false=JPEG
-} brewingData = { nullptr, 0, 0, 0, 1, false, false };
+  bool     isPng;            // true=PNG, false=JPEG
+  int      lastError;        // last HTTP code or error (for on-screen debug)
+} brewingData = { nullptr, 0, 0, 0, 0, 1, false, false, 0 };
 
 PNG png;  // PNGdec instance for coffee image
 
 unsigned long lastBrewingFetch = 0;
 const unsigned long BREWING_INTERVAL = 600000;  // 10 min refresh
+const unsigned long BREWING_RETRY_INTERVAL = 30000;  // 30s retry on failure
 bool brewingScreenWasActive = false;
 char lastBrewingUrl[256] = "";  // detect URL changes
+
+extern int currentScreen;  // defined later with screen array
+
+// --- Debug/Log API endpoints (registered after data structs exist) ---
+void setupDebugEndpoints() {
+  // GET /api/debug — system diagnostics as JSON
+  server.on("/api/debug", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+
+    doc["psram_free_kb"] = ESP.getFreePsram() / 1024;
+    doc["psram_total_kb"] = ESP.getPsramSize() / 1024;
+    doc["heap_free_kb"] = ESP.getFreeHeap() / 1024;
+    doc["heap_total_kb"] = ESP.getHeapSize() / 1024;
+    doc["current_screen"] = currentScreen;
+    doc["uptime_sec"] = millis() / 1000;
+
+    JsonObject brew = doc["brewing"].to<JsonObject>();
+    brew["buf_allocated"] = (brewingData.imgBuf != nullptr);
+    brew["buf_size_kb"] = (int)(brewingData.bufSize / 1024);
+    brew["valid"] = brewingData.valid;
+    brew["is_png"] = brewingData.isPng;
+    brew["http_code"] = brewingData.lastError;
+    brew["img_len"] = (int)brewingData.imgLen;
+    brew["img_w"] = brewingData.imgW;
+    brew["img_h"] = brewingData.imgH;
+    brew["scale"] = brewingData.scale;
+    brew["url"] = config.coffee_img;
+
+    JsonObject ring = doc["ring_cam"].to<JsonObject>();
+    ring["buf_allocated"] = (ringCamData.jpegBuf != nullptr);
+    ring["valid"] = ringCamData.valid;
+    ring["jpeg_len"] = (int)ringCamData.jpegLen;
+    ring["current_cam"] = ringCamData.currentCam;
+
+    JsonObject data = doc["data_status"].to<JsonObject>();
+    data["weather"] = weatherData.valid;
+    data["humidity"] = humidityData.valid;
+    data["espresso_state"] = espressoData.stateValid;
+    data["espresso_history"] = espressoData.historyValid;
+    data["backyard"] = backyardData.valid;
+    data["sump_state"] = sumpData.stateValid;
+    data["sump_history"] = sumpData.historyValid;
+
+    doc["wifi_rssi"] = WiFi.RSSI();
+    doc["wifi_ip"] = WiFi.localIP().toString();
+
+    String json;
+    serializeJsonPretty(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // GET /api/log — recent log messages
+  server.on("/api/log", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String out = "";
+    int start = (logCount < LOG_LINES) ? 0 : logHead;
+    for (int i = 0; i < logCount; i++) {
+      int idx = (start + i) % LOG_LINES;
+      out += logRing[idx];
+      out += "\n";
+    }
+    request->send(200, "text/plain", out);
+  });
+}
 
 // --- HA Helper: fetch a single entity state ---
 bool fetchHAState(const char* entityId, char* state, size_t stateLen) {
@@ -1287,21 +1372,30 @@ bool fetchRingSnapshot() {
 bool fetchBrewingImage() {
   if (strlen(config.coffee_img) == 0) return false;
 
-  // Allocate buffer on first call (384KB for large PNG images, PSRAM only)
+  // Allocate image buffer (try PSRAM first for large buffer, fall back to heap)
   if (brewingData.imgBuf == nullptr) {
-    brewingData.imgBuf = (uint8_t*)ps_malloc(393216);
-    if (brewingData.imgBuf == nullptr) {
-      Serial.println("Brew: PSRAM alloc failed for 384KB!");
-      brewingData.imgBuf = (uint8_t*)ps_malloc(131072);  // try 128KB fallback
+    logMsg("Brew: PSRAM=%dKB heap=%dKB", ESP.getPsramSize()/1024, ESP.getFreeHeap()/1024);
+    // Try PSRAM first (384KB), then heap (128KB)
+    static const size_t ALLOC_ATTEMPTS[][2] = {
+      {393216, 1}, {131072, 1},  // PSRAM
+      {131072, 0}, {65536, 0}    // heap
+    };
+    for (auto &a : ALLOC_ATTEMPTS) {
+      brewingData.imgBuf = (uint8_t*)(a[1] ? ps_malloc(a[0]) : malloc(a[0]));
+      if (brewingData.imgBuf) {
+        brewingData.bufSize = a[0];
+        logMsg("Brew: Allocated %dKB from %s", (int)(a[0]/1024), a[1] ? "PSRAM" : "heap");
+        break;
+      }
     }
     if (brewingData.imgBuf == nullptr) {
-      Serial.println("Brew: Buffer alloc failed!");
+      logMsg("Brew: All alloc attempts failed");
       return false;
     }
   }
 
   HTTPClient http;
-  Serial.printf("Brew: Fetching %s\n", config.coffee_img);
+  logMsg("Brew: Fetching %s", config.coffee_img);
 
   // Support HTTPS URLs (skip certificate verification for simplicity)
   WiFiClientSecure *secureClient = nullptr;
@@ -1316,17 +1410,24 @@ bool fetchBrewingImage() {
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.addHeader("User-Agent", "ESP32-InfoDisplay/1.0");
 
+  logMsg("Brew: HTTP GET starting...");
   int code = http.GET();
   bool ok = false;
+  brewingData.lastError = code;
+  logMsg("Brew: HTTP response code=%d", code);
 
   if (code == 200) {
     int len = http.getSize();
-    Serial.printf("Brew: HTTP 200, Content-Length: %d\n", len);
+    logMsg("Brew: HTTP 200, Content-Length=%d", len);
 
     WiFiClient *stream = http.getStreamPtr();
     size_t bytesRead = 0;
-    size_t maxLen = 393216;  // 384KB
+    size_t maxLen = brewingData.bufSize;
     size_t toRead = (len > 0 && (size_t)len <= maxLen) ? (size_t)len : maxLen;
+
+    if (len > 0 && (size_t)len > maxLen) {
+      logMsg("Brew: WARNING image %dKB exceeds %dKB buffer - will be truncated", len/1024, (int)(maxLen/1024));
+    }
 
     unsigned long start = millis();
     while (bytesRead < toRead && millis() - start < 15000) {
@@ -1343,6 +1444,15 @@ bool fetchBrewingImage() {
       }
     }
 
+    logMsg("Brew: Read %d bytes in %lums", bytesRead, millis() - start);
+
+    // Check for truncation — incomplete PNG/JPEG files can't be decoded
+    if (len > 0 && bytesRead < (size_t)len) {
+      logMsg("Brew: TRUNCATED %d/%d bytes - image too large for buffer, use a smaller image", (int)bytesRead, len);
+      brewingData.lastError = -200;  // custom: truncated
+      bytesRead = 0;  // don't try to decode
+    }
+
     if (bytesRead > 0) {
       brewingData.imgLen = bytesRead;
 
@@ -1354,17 +1464,16 @@ bool fetchBrewingImage() {
 
       uint16_t rawW = 0, rawH = 0;
       if (isPng) {
-        // PNG: read dimensions from IHDR chunk (bytes 16-23)
         if (bytesRead >= 24) {
-          rawW = (brewingData.imgBuf[16] << 24) | (brewingData.imgBuf[17] << 16) |
-                 (brewingData.imgBuf[18] << 8) | brewingData.imgBuf[19];
-          rawH = (brewingData.imgBuf[20] << 24) | (brewingData.imgBuf[21] << 16) |
-                 (brewingData.imgBuf[22] << 8) | brewingData.imgBuf[23];
+          rawW = ((uint32_t)brewingData.imgBuf[16] << 24) | ((uint32_t)brewingData.imgBuf[17] << 16) |
+                 ((uint32_t)brewingData.imgBuf[18] << 8) | brewingData.imgBuf[19];
+          rawH = ((uint32_t)brewingData.imgBuf[20] << 24) | ((uint32_t)brewingData.imgBuf[21] << 16) |
+                 ((uint32_t)brewingData.imgBuf[22] << 8) | brewingData.imgBuf[23];
         }
-        Serial.printf("Brew: PNG %dx%d (%d bytes)\n", rawW, rawH, bytesRead);
+        logMsg("Brew: PNG %dx%d (%d bytes)", rawW, rawH, bytesRead);
       } else {
         TJpgDec.getJpgSize(&rawW, &rawH, brewingData.imgBuf, brewingData.imgLen);
-        Serial.printf("Brew: JPEG %dx%d (%d bytes)\n", rawW, rawH, bytesRead);
+        logMsg("Brew: JPEG %dx%d (%d bytes)", rawW, rawH, bytesRead);
       }
 
       // Pick scale to fit in 150x170 area
@@ -1381,18 +1490,20 @@ bool fetchBrewingImage() {
       brewingData.imgH = rawH / brewingData.scale;
       brewingData.valid = true;
       ok = true;
-      Serial.printf("Brew: Scale 1/%d -> %dx%d (%s)\n",
+      logMsg("Brew: Scale 1/%d -> %dx%d (%s)",
         brewingData.scale, brewingData.imgW, brewingData.imgH, isPng ? "PNG" : "JPEG");
     } else {
-      Serial.println("Brew: No bytes received");
+      logMsg("Brew: No bytes received");
+      brewingData.lastError = -100;  // custom: 0 bytes
     }
   } else {
-    Serial.printf("Brew: HTTP %d\n", code);
+    logMsg("Brew: HTTP error %d", code);
   }
 
   http.end();
   if (secureClient) delete secureClient;
-  if (ok) strlcpy(lastBrewingUrl, config.coffee_img, sizeof(lastBrewingUrl));
+  strlcpy(lastBrewingUrl, config.coffee_img, sizeof(lastBrewingUrl));
+  logMsg("Brew: fetch done, ok=%d", ok);
   return ok;
 }
 
@@ -2206,8 +2317,19 @@ void drawScreenBrewing() {
   } else if (strlen(config.coffee_img) > 0) {
     sprite.setTextColor(CLR_DIM);
     sprite.setTextSize(1);
-    sprite.drawString("Loading", 40, 78);
-    sprite.drawString("image...", 40, 92);
+    if (brewingData.lastError == -200) {
+      sprite.drawString("Image too", 20, 70);
+      sprite.drawString("large for", 20, 84);
+      sprite.drawString("memory", 20, 98);
+    } else if (brewingData.lastError != 0 && brewingData.lastError != 200) {
+      char errBuf[32];
+      snprintf(errBuf, sizeof(errBuf), "HTTP %d", brewingData.lastError);
+      sprite.drawString(errBuf, 20, 78);
+      sprite.drawString("Retrying...", 20, 94);
+    } else {
+      sprite.drawString("Loading", 40, 78);
+      sprite.drawString("image...", 40, 92);
+    }
   }
 
   sprite.pushSprite(0, 0);
@@ -2460,6 +2582,7 @@ void setup() {
 
   // Start web server (works in both STA and AP mode)
   setupWebServer();
+  setupDebugEndpoints();  // registers /api/debug and /api/log
 
   // Find first active screen
   for (int i = 0; i < NUM_SCREENS; i++) {
@@ -2547,14 +2670,15 @@ void loop() {
     }
     ringScreenWasActive = ringIsActive;
 
-    // Now Brewing: fetch on screen transition, URL change, or periodic refresh
+    // Now Brewing: fetch on screen transition, URL change, or periodic refresh/retry
     bool brewIsActive = config.screen_brewing &&
                         allScreens[currentScreen].draw == drawScreenBrewing;
     bool urlChanged = strcmp(config.coffee_img, lastBrewingUrl) != 0;
+    unsigned long brewInterval = brewingData.valid ? BREWING_INTERVAL : BREWING_RETRY_INTERVAL;
     if (brewIsActive && (!brewingScreenWasActive || urlChanged)) {
       fetchBrewingImage();
       lastBrewingFetch = now;
-    } else if (brewIsActive && now - lastBrewingFetch >= BREWING_INTERVAL) {
+    } else if (brewIsActive && now - lastBrewingFetch >= brewInterval) {
       fetchBrewingImage();
       lastBrewingFetch = now;
     }
