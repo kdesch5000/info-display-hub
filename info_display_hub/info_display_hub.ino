@@ -143,6 +143,7 @@ struct Config {
   bool screen_sump;
   bool screen_ring;
   bool screen_brewing;
+  bool screen_radar;
   char coffee_name[64];
   char coffee_img[256];     // URL to JPEG image of coffee bag
 } config;
@@ -166,6 +167,7 @@ void loadConfig() {
   config.screen_sump     = prefs.getBool("scr_sump", false);
   config.screen_ring     = prefs.getBool("scr_ring", false);
   config.screen_brewing  = prefs.getBool("scr_brew", false);
+  config.screen_radar    = prefs.getBool("scr_radar", false);
   strlcpy(config.coffee_name,    prefs.getString("cof_name", "").c_str(),    sizeof(config.coffee_name));
   strlcpy(config.coffee_img,     prefs.getString("cof_img", "").c_str(),     sizeof(config.coffee_img));
   prefs.end();
@@ -190,6 +192,7 @@ void saveConfig() {
   prefs.putBool("scr_sump",       config.screen_sump);
   prefs.putBool("scr_ring",       config.screen_ring);
   prefs.putBool("scr_brew",       config.screen_brewing);
+  prefs.putBool("scr_radar",      config.screen_radar);
   prefs.putString("cof_name",     config.coffee_name);
   prefs.putString("cof_img",      config.coffee_img);
   prefs.end();
@@ -409,6 +412,12 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
         <label class="toggle"><input type="checkbox" name="scr_ring" id="scr_ring"><span class="slider"></span></label>
       </div>
 
+      <p class="section-label">Weather Radar</p>
+      <div class="toggle-row">
+        <span>Radar Map</span>
+        <label class="toggle"><input type="checkbox" name="scr_radar" id="scr_radar"><span class="slider"></span></label>
+      </div>
+
       <p class="section-label">Coffee Screen</p>
       <div class="toggle-row">
         <span>Now Brewing</span>
@@ -471,6 +480,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
     document.getElementById('scr_sump').checked = c.scr_sump;
     document.getElementById('scr_ring').checked = c.scr_ring;
     document.getElementById('scr_brewing').checked = c.scr_brewing;
+    document.getElementById('scr_radar').checked = c.scr_radar;
     document.getElementById('coffee_name').value = c.coffee_name || '';
     document.getElementById('coffee_img').value = c.coffee_img || '';
     updateCoffeePreview();
@@ -497,6 +507,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
       scr_sump: document.getElementById('scr_sump').checked,
       scr_ring: document.getElementById('scr_ring').checked,
       scr_brewing: document.getElementById('scr_brewing').checked,
+      scr_radar: document.getElementById('scr_radar').checked,
       coffee_name: document.getElementById('coffee_name').value,
       coffee_img: document.getElementById('coffee_img').value,
     };
@@ -575,6 +586,7 @@ void setupWebServer() {
     doc["scr_sump"]     = config.screen_sump;
     doc["scr_ring"]     = config.screen_ring;
     doc["scr_brewing"]  = config.screen_brewing;
+    doc["scr_radar"]    = config.screen_radar;
     doc["coffee_name"]  = config.coffee_name;
     doc["coffee_img"]   = config.coffee_img;
     String json;
@@ -604,6 +616,7 @@ void setupWebServer() {
       config.screen_sump     = obj["scr_sump"]      | false;
       config.screen_ring     = obj["scr_ring"]      | false;
       config.screen_brewing  = obj["scr_brewing"]   | false;
+      config.screen_radar    = obj["scr_radar"]     | false;
       strlcpy(config.coffee_name,     obj["coffee_name"] | "",     sizeof(config.coffee_name));
       strlcpy(config.coffee_img,      obj["coffee_img"] | "",      sizeof(config.coffee_img));
 
@@ -983,6 +996,26 @@ const unsigned long BREWING_RETRY_INTERVAL = 30000;  // 30s retry on failure
 bool brewingScreenWasActive = false;
 char lastBrewingUrl[256] = "";  // detect URL changes
 
+// Weather radar data (RainViewer API)
+struct RadarData {
+  uint8_t *imgBuf;
+  size_t   imgLen;
+  size_t   bufSize;
+  bool     valid;
+  char     timestamp[20];    // human-readable time of radar frame
+  int      lastError;
+} radarData = { nullptr, 0, 0, false, "", 0 };
+
+unsigned long lastRadarFetch = 0;
+const unsigned long RADAR_INTERVAL = 300000;    // 5 min refresh
+const unsigned long RADAR_RETRY_INTERVAL = 30000;
+bool radarScreenWasActive = false;
+
+// Chicago coordinates for radar tile
+#define RADAR_LAT 41.8781
+#define RADAR_LON -87.6298
+#define RADAR_ZOOM 7
+
 extern int currentScreen;  // defined later with screen array
 
 // --- Debug/Log API endpoints (registered after data structs exist) ---
@@ -1015,6 +1048,13 @@ void setupDebugEndpoints() {
     ring["valid"] = ringCamData.valid;
     ring["jpeg_len"] = (int)ringCamData.jpegLen;
     ring["current_cam"] = ringCamData.currentCam;
+
+    JsonObject radar = doc["radar"].to<JsonObject>();
+    radar["buf_allocated"] = (radarData.imgBuf != nullptr);
+    radar["valid"] = radarData.valid;
+    radar["img_len"] = (int)radarData.imgLen;
+    radar["http_code"] = radarData.lastError;
+    radar["timestamp"] = radarData.timestamp;
 
     JsonObject data = doc["data_status"].to<JsonObject>();
     data["weather"] = weatherData.valid;
@@ -1507,6 +1547,123 @@ bool fetchBrewingImage() {
   return ok;
 }
 
+// --- Weather Radar fetch (RainViewer API) ---
+bool fetchRadarTile() {
+  // Allocate buffer on first call (radar tiles are small, ~2-25KB)
+  if (radarData.imgBuf == nullptr) {
+    size_t sz = 32768;  // 32KB is plenty for a 256x256 radar tile
+    radarData.imgBuf = (uint8_t*)ps_malloc(sz);
+    if (!radarData.imgBuf) radarData.imgBuf = (uint8_t*)malloc(sz);
+    if (!radarData.imgBuf) {
+      logMsg("Radar: alloc failed");
+      return false;
+    }
+    radarData.bufSize = sz;
+    logMsg("Radar: Allocated %dKB", (int)(sz / 1024));
+  }
+
+  // Step 1: Fetch the radar frame list to get the latest timestamp/path
+  WiFiClientSecure secClient;
+  secClient.setInsecure();
+  HTTPClient http;
+  http.begin(secClient, "https://api.rainviewer.com/public/weather-maps.json");
+  http.setTimeout(8000);
+
+  int code = http.GET();
+  if (code != 200) {
+    logMsg("Radar: weather-maps.json HTTP %d", code);
+    radarData.lastError = code;
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument mapDoc;
+  DeserializationError err = deserializeJson(mapDoc, payload);
+  if (err) {
+    logMsg("Radar: JSON parse error: %s", err.c_str());
+    radarData.lastError = -300;
+    return false;
+  }
+
+  // Get the latest radar frame
+  const char* host = mapDoc["host"] | "https://tilecache.rainviewer.com";
+  JsonArray past = mapDoc["radar"]["past"].as<JsonArray>();
+  if (past.size() == 0) {
+    logMsg("Radar: no past frames");
+    radarData.lastError = -301;
+    return false;
+  }
+
+  // Use the most recent frame
+  JsonObject latest = past[past.size() - 1];
+  const char* path = latest["path"] | "";
+  long frameTime = latest["time"] | 0;
+
+  // Format timestamp for display
+  time_t ft = (time_t)frameTime;
+  struct tm *ftm = localtime(&ft);
+  if (ftm) {
+    strftime(radarData.timestamp, sizeof(radarData.timestamp), "%I:%M %p", ftm);
+  }
+
+  // Step 2: Fetch the radar tile using coordinate-based URL
+  // Format: {host}{path}/256/{z}/{lat}/{lon}/{color}/{smooth}_{snow}.png
+  char tileUrl[256];
+  snprintf(tileUrl, sizeof(tileUrl), "%s%s/256/%d/%.4f/%.4f/2/1_1.png",
+           host, path, RADAR_ZOOM, RADAR_LAT, RADAR_LON);
+  logMsg("Radar: Fetching %s", tileUrl);
+
+  WiFiClientSecure secClient2;
+  secClient2.setInsecure();
+  HTTPClient http2;
+  http2.begin(secClient2, tileUrl);
+  http2.setTimeout(8000);
+
+  code = http2.GET();
+  radarData.lastError = code;
+  bool ok = false;
+
+  if (code == 200) {
+    int len = http2.getSize();
+    WiFiClient *stream = http2.getStreamPtr();
+    size_t bytesRead = 0;
+    size_t maxLen = radarData.bufSize;
+    size_t toRead = (len > 0 && (size_t)len <= maxLen) ? (size_t)len : maxLen;
+
+    unsigned long start = millis();
+    while (bytesRead < toRead && millis() - start < 10000) {
+      if (stream->available()) {
+        int avail = stream->available();
+        int chunk = (avail < (int)(toRead - bytesRead)) ? avail : (int)(toRead - bytesRead);
+        int got = stream->readBytes(radarData.imgBuf + bytesRead, chunk);
+        bytesRead += got;
+      } else if (!stream->connected()) {
+        break;
+      } else {
+        delay(1);
+      }
+    }
+
+    if (len > 0 && bytesRead < (size_t)len) {
+      logMsg("Radar: truncated %d/%d", (int)bytesRead, len);
+      radarData.lastError = -200;
+    } else if (bytesRead > 0) {
+      radarData.imgLen = bytesRead;
+      radarData.valid = true;
+      ok = true;
+      logMsg("Radar: Got %d bytes in %lums", (int)bytesRead, millis() - start);
+    }
+  } else {
+    logMsg("Radar: tile HTTP %d", code);
+  }
+
+  http2.end();
+  return ok;
+}
+
 // ============================================================
 // DISPLAY SCREENS
 // ============================================================
@@ -1536,30 +1693,44 @@ bool jpgDrawCallback(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bit
 }
 
 // PNGdec callback: render decoded PNG lines into sprite
-// Uses jpgOffsetX/Y globals and brewingData.scale for positioning/scaling
-// Static buffer sized for large source PNGs (scaled down during rendering)
+// Uses jpgOffsetX/Y and pngScale globals for positioning/scaling
 static uint16_t pngLineBuffer[1024];  // supports source PNGs up to 1024px wide
+int pngScale = 1;  // set before calling png.decode()
+
+static uint8_t pngAlphaBuffer[1024];  // alpha channel for transparency handling
+bool pngSkipTransparent = false;       // when true, skip fully transparent pixels
 
 int pngDrawCallback(PNGDRAW *pDraw) {
-  if (pDraw->iWidth > 1024) return 1;  // skip lines wider than our buffer
-  int scale = brewingData.scale;
-  if (pDraw->y % scale != 0) return 1;  // skip rows for scaling
+  if (pDraw->iWidth > 1024) return 1;
+  int scale = pngScale;
+  if (pDraw->y % scale != 0) return 1;
 
   int16_t sy = (pDraw->y / scale) + jpgOffsetY;
   if (sy < 0 || sy >= SCREEN_HEIGHT) return 1;
 
   // Decode the PNG line to RGB565
-  png.getLineAsRGB565(pDraw, pngLineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
+  png.getLineAsRGB565(pDraw, pngLineBuffer, PNG_RGB565_BIG_ENDIAN, 0x00000000);
 
-  // Draw scaled pixels
+  // Get alpha mask if we need transparency handling
+  bool hasAlpha = pngSkipTransparent && (pDraw->iHasAlpha || pDraw->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA);
+  if (hasAlpha) {
+    png.getAlphaMask(pDraw, pngAlphaBuffer, 1);  // 1-bit alpha: 0=transparent, 1=opaque
+  }
+
   int srcW = pDraw->iWidth;
   for (int srcX = 0; srcX < srcW; srcX += scale) {
+    // Check alpha: skip transparent pixels to preserve background
+    if (hasAlpha) {
+      int byteIdx = srcX / 8;
+      int bitIdx = 7 - (srcX % 8);
+      if (!(pngAlphaBuffer[byteIdx] & (1 << bitIdx))) continue;
+    }
     int16_t sx = (srcX / scale) + jpgOffsetX;
     if (sx >= 0 && sx < SCREEN_WIDTH) {
       sprite.drawPixel(sx, sy, pngLineBuffer[srcX]);
     }
   }
-  return 1;  // continue decoding
+  return 1;
 }
 
 // (Color palette defined at top of file)
@@ -2305,6 +2476,8 @@ void drawScreenBrewing() {
     jpgOffsetY = cy;
 
     if (brewingData.isPng) {
+      pngScale = brewingData.scale;
+      pngSkipTransparent = false;
       int rc = png.openRAM(brewingData.imgBuf, brewingData.imgLen, pngDrawCallback);
       if (rc == PNG_SUCCESS) {
         png.decode(NULL, 0);
@@ -2505,6 +2678,77 @@ void drawWifiLogScreen() {
 }
 
 // ============================================================
+// WEATHER RADAR SCREEN
+// ============================================================
+void drawScreenRadar() {
+  sprite.fillSprite(CLR_BG);
+
+  // Header
+  sprite.setTextColor(CLR_PRIMARY);
+  sprite.setTextSize(2);
+  sprite.drawString("RADAR", 12, 8);
+
+  // Timestamp of radar frame
+  sprite.setTextColor(CLR_DIM);
+  sprite.setTextSize(1);
+  if (strlen(radarData.timestamp) > 0) {
+    int tw = sprite.textWidth(radarData.timestamp);
+    sprite.drawString(radarData.timestamp, SCREEN_WIDTH - tw - 8, 14);
+  }
+
+  sprite.drawFastHLine(12, 28, SCREEN_WIDTH - 24, CLR_DIM);
+
+  if (radarData.valid && radarData.imgBuf != nullptr) {
+    // Decode PNG radar tile into sprite
+    // Tile is 256x256, we'll center it in the area below the header (170 wide, 288 tall)
+    // Scale or crop to fit: 256 > 170 wide, so we need to crop horizontally
+    // Center: offset X = -(256-170)/2 = -43, offset Y = 32 (below header)
+    jpgOffsetX = -43;  // crop 43px from left edge to center 170px window
+    jpgOffsetY = 32;   // start below header
+
+    pngScale = 1;  // radar tiles are 256x256, no scaling needed
+    pngSkipTransparent = true;  // skip transparent pixels to show background
+    int rc = png.openRAM(radarData.imgBuf, radarData.imgLen, pngDrawCallback);
+    if (rc == PNG_SUCCESS) {
+      png.decode(NULL, 0);
+      png.close();
+    } else {
+      logMsg("Radar: PNG decode failed rc=%d", rc);
+    }
+
+    // City marker dot at center
+    int16_t cx = SCREEN_WIDTH / 2;
+    int16_t cy = 32 + 128;  // center of 256px tile vertically offset
+    sprite.fillCircle(cx, cy, 3, CLR_TEXT);
+    sprite.drawCircle(cx, cy, 5, CLR_DIM);
+
+    // Label
+    sprite.setTextColor(CLR_TEXT);
+    sprite.setTextSize(1);
+    sprite.drawString("Chicago", cx + 8, cy - 4);
+
+    // "No precipitation" message if tile is very small (mostly transparent)
+    if (radarData.imgLen < 2000) {
+      sprite.setTextColor(CLR_DIM);
+      sprite.setTextSize(1);
+      sprite.drawString("Clear skies", 12, SCREEN_HEIGHT - 16);
+    }
+  } else if (radarData.lastError != 0 && radarData.lastError != 200) {
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    char errBuf[32];
+    snprintf(errBuf, sizeof(errBuf), "Error: %d", radarData.lastError);
+    sprite.drawString(errBuf, 12, 50);
+  } else {
+    sprite.setTextColor(CLR_DIM);
+    sprite.setTextSize(1);
+    sprite.drawString("Loading radar...", 12, 50);
+  }
+
+  sprite.pushSprite(0, 0);
+}
+
+// ============================================================
 // SCREEN ROTATION LOGIC
 // ============================================================
 
@@ -2525,6 +2769,7 @@ Screen allScreens[] = {
   { drawScreenSump,     &config.screen_sump },
   { drawScreenRingCam,  &config.screen_ring },
   { drawScreenBrewing,  &config.screen_brewing },
+  { drawScreenRadar,    &config.screen_radar },
 };
 const int NUM_SCREENS = sizeof(allScreens) / sizeof(Screen);
 
@@ -2683,6 +2928,19 @@ void loop() {
       lastBrewingFetch = now;
     }
     brewingScreenWasActive = brewIsActive;
+
+    // Weather Radar: fetch on screen transition or periodic refresh
+    bool radarIsActive = config.screen_radar &&
+                         allScreens[currentScreen].draw == drawScreenRadar;
+    unsigned long radarInterval = radarData.valid ? RADAR_INTERVAL : RADAR_RETRY_INTERVAL;
+    if (radarIsActive && !radarScreenWasActive) {
+      fetchRadarTile();
+      lastRadarFetch = now;
+    } else if (radarIsActive && now - lastRadarFetch >= radarInterval) {
+      fetchRadarTile();
+      lastRadarFetch = now;
+    }
+    radarScreenWasActive = radarIsActive;
   }
 
   // --- Draw current screen ---
